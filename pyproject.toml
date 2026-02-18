@@ -1,0 +1,26 @@
+[project]
+name = "pymshbm"
+version = "0.1.0"
+description = "Python port of the Multi-Scale Hierarchical Bayesian Model for brain parcellation"
+readme = "README.md"
+authors = [
+    { name = "Russell Poldrack", email = "poldrack@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "numpy",
+    "scipy",
+    "nibabel",
+    "h5py",
+    "pytest>=9.0.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.18,<0.10.0"]
+build-backend = "uv_build"
