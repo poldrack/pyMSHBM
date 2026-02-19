@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from scipy.special import iv as besseli
 
-from pymshbm.math.vmf import ad, cdln, inv_ad, vmf_log_probability
+from pymshbm.math.vmf import ad, cdln, inv_ad, inv_ad_batch, vmf_log_probability
 
 
 class TestAd:
@@ -91,6 +91,44 @@ class TestInvAd:
         result = inv_ad(20, 0.5)
         assert np.isfinite(result)
         assert result > 0
+
+
+class TestInvAdBatch:
+    """Tests for the vectorized inverse Bessel quotient."""
+
+    def test_recovers_rbar(self):
+        """inv_ad_batch(d, rbar) should satisfy ad(result, d) ≈ rbar."""
+        d = 100
+        rbar_values = np.array([0.1, 0.3, 0.5, 0.7, 0.9])
+        batch_result = inv_ad_batch(d, rbar_values)
+        recovered = ad(batch_result, d)
+        np.testing.assert_allclose(recovered, rbar_values, atol=1e-6)
+
+    def test_high_dimension(self):
+        """inv_ad_batch should work for high d (like real brain data)."""
+        d = 1283
+        rbar_values = np.array([0.2, 0.5, 0.8, 0.95])
+        batch_result = inv_ad_batch(d, rbar_values)
+        assert batch_result.shape == (4,)
+        assert np.all(np.isfinite(batch_result))
+        assert np.all(batch_result > 0)
+        # Higher rbar should give higher kappa
+        assert np.all(np.diff(batch_result) > 0)
+
+    def test_roundtrip(self):
+        """inv_ad_batch(d, ad(kappa, d)) should recover kappa."""
+        d = 50
+        kappas = np.array([5.0, 20.0, 100.0, 500.0])
+        rbars = ad(kappas, d)
+        recovered = inv_ad_batch(d, rbars)
+        np.testing.assert_allclose(recovered, kappas, rtol=1e-3)
+
+    def test_single_element(self):
+        """inv_ad_batch should handle single-element arrays."""
+        d = 100
+        result = inv_ad_batch(d, np.array([0.5]))
+        assert result.shape == (1,)
+        assert np.isfinite(result[0])
 
 
 class TestVmfLogProbability:

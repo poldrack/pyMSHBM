@@ -147,7 +147,7 @@ def _open_profiles_zarr(
 
     Shape: (N_vertices, D_seeds, S_subjects, T_max_sessions).
     Chunks: one chunk per (subject, session). fill_value=NaN for
-    detecting unwritten chunks.
+    detecting unwritten chunks. Uses float32 to halve memory footprint.
     """
     mode = "w" if overwrite else "a"
     if not store_path.exists() or overwrite:
@@ -155,7 +155,7 @@ def _open_profiles_zarr(
             str(store_path), mode=mode,
             shape=(n_vertices, n_seeds, num_subs, max_sessions),
             chunks=(n_vertices, n_seeds, 1, 1),
-            dtype="float64",
+            dtype="float32",
             fill_value=float("nan"),
         )
     return zarr.open_array(str(store_path), mode="r+")

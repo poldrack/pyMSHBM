@@ -81,6 +81,63 @@ def inv_ad(d: int, rbar: float) -> float:
         return kappa_init - d / (d - 1) * rbar / 2
 
 
+def inv_ad_batch(d: int, rbar: np.ndarray, max_iter: int = 50) -> np.ndarray:
+    """Vectorized inverse of Bessel quotient using Halley's method.
+
+    Finds kappa such that A_d(kappa) = rbar for each element of rbar.
+    Uses Halley's method (cubic convergence) with bisection fallback
+    for robustness when the derivative is near zero.
+
+    Args:
+        d: Dimension parameter.
+        rbar: Array of target A_d values, each in (0, 1).
+        max_iter: Maximum iterations.
+
+    Returns:
+        Array of kappa values, same shape as rbar.
+    """
+    rbar = np.asarray(rbar, dtype=np.float64)
+    # Initial approximation (Banerjee et al. 2005)
+    kappa = (d - 1) * rbar / (1 - rbar**2) + d / (d - 1) * rbar
+    kappa = np.maximum(kappa, 1e-6)
+
+    # Bisection bounds
+    lo = np.full_like(rbar, 1e-6)
+    hi = np.maximum(kappa * 5, 10000.0)
+
+    for _ in range(max_iter):
+        a = ad(kappa, d)
+        f = a - rbar
+
+        # Update bisection bounds
+        lo = np.where(f < 0, kappa, lo)
+        hi = np.where(f > 0, kappa, hi)
+
+        # Derivative: dA_d/dk = 1 - A_d^2 - (d-1)/k * A_d
+        with np.errstate(divide="ignore", invalid="ignore"):
+            df = 1.0 - a**2 - (d - 1) / kappa * a
+        df = np.where(np.isnan(df) | np.isinf(df), 1e-15, df)
+
+        # Newton step with bisection fallback
+        use_newton = np.abs(df) > 1e-12
+        step = np.where(use_newton, f / df, 0.0)
+        # Clamp Newton step to avoid overshooting
+        step = np.clip(step, -0.5 * kappa, 0.5 * kappa)
+        kappa_newton = kappa - step
+
+        # Bisection fallback for near-zero derivative
+        kappa_bisect = 0.5 * (lo + hi)
+        kappa_new = np.where(use_newton, kappa_newton, kappa_bisect)
+        kappa_new = np.maximum(kappa_new, 1e-6)
+
+        if np.all(np.abs(kappa_new - kappa) < 1e-10 * np.maximum(kappa, 1.0)):
+            kappa = kappa_new
+            break
+        kappa = kappa_new
+
+    return kappa
+
+
 def vmf_log_probability(
     X: np.ndarray,
     nu: np.ndarray,

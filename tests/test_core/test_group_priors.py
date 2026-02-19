@@ -138,6 +138,36 @@ def test_estimate_group_priors_converges(synthetic_data, synthetic_g_mu, small_s
     assert len(params.record) >= 1
 
 
+def test_estimate_group_priors_float32_close_to_float64():
+    """float32 data should produce results close to float64."""
+    rng = np.random.default_rng(42)
+    N, D, S, T, L = 20, 10, 2, 2, 3
+    data_f64 = rng.standard_normal((N, D, S, T))
+    for s in range(S):
+        for t in range(T):
+            norms = np.linalg.norm(data_f64[:, :, s, t], axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            data_f64[:, :, s, t] /= norms
+
+    g_mu = rng.standard_normal((D, L))
+    g_mu /= np.linalg.norm(g_mu, axis=0, keepdims=True)
+
+    settings = {
+        "num_sub": S, "num_session": T, "num_clusters": L,
+        "dim": D - 1, "ini_concentration": 500,
+        "epsilon": 1e-4, "conv_th": 1e-5, "max_iter": 5,
+    }
+    params_f64 = estimate_group_priors(data_f64, g_mu, settings)
+
+    data_f32 = data_f64.astype(np.float32)
+    params_f32 = estimate_group_priors(data_f32, g_mu, settings)
+
+    np.testing.assert_allclose(params_f32.mu, params_f64.mu, atol=1e-4)
+    np.testing.assert_allclose(params_f32.sigma, params_f64.sigma, rtol=0.01)
+    np.testing.assert_allclose(params_f32.theta, params_f64.theta, atol=1e-3)
+    assert params_f32.iter_inter == params_f64.iter_inter
+
+
 def test_estimate_group_priors_numerical_regression():
     """Regression test: verify exact numerical output hasn't changed."""
     rng = np.random.default_rng(42)

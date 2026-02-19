@@ -8,7 +8,7 @@ import logging
 
 import numpy as np
 
-from pymshbm.math.vmf import ad, cdln, inv_ad, vmf_log_probability
+from pymshbm.math.vmf import ad, cdln, inv_ad, inv_ad_batch, vmf_log_probability
 from pymshbm.types import MSHBMParams
 
 logger = logging.getLogger(__name__)
@@ -155,7 +155,11 @@ def vmf_clustering_subject_session(
 
     for iter_em in range(1, 102):
         # M-step: update kappa and s_t_nu
-        _m_step(params, settings, data, epsilon, c0)
+        # weighted_data depends only on s_lambda (constant within M-step),
+        # so compute it once before the M-step inner loop.
+        weighted_data = _compute_weighted_data(data, params.s_lambda, S, T)
+        _m_step(params, settings, data, epsilon, c0,
+                weighted_data=weighted_data)
 
         # E-step: update s_lambda and theta; cache log-likelihoods
         log_vmf_cache = _e_step(params, settings, data)
@@ -178,26 +182,57 @@ def vmf_clustering_subject_session(
     return params
 
 
+def _compute_weighted_data(
+    data: np.ndarray,
+    s_lambda: np.ndarray,
+    S: int,
+    T: int,
+) -> np.ndarray:
+    """Compute weighted_data[d,l,s,t] = sum_n data[n,d,s,t] * s_lambda[n,l,s].
+
+    Uses explicit BLAS matmuls per (s,t) slice for guaranteed GEMM dispatch.
+    Result shape: (D, L, S, T).
+    """
+    N, D = data.shape[0], data.shape[1]
+    L = s_lambda.shape[1]
+    result = np.empty((D, L, S, T), dtype=np.float64)
+    for s in range(S):
+        sl = s_lambda[:, :, s]  # (N, L)
+        for t in range(T):
+            # (D, N) @ (N, L) -> (D, L)
+            result[:, :, s, t] = data[:, :, s, t].T @ sl
+    return result
+
+
 def _m_step(
     params: MSHBMParams,
     settings: dict,
     data: np.ndarray,
     epsilon: float,
     c0: float,
+    weighted_data: np.ndarray | None = None,
 ) -> None:
-    """M-step: update kappa and s_t_nu."""
+    """M-step: update kappa and s_t_nu.
+
+    Args:
+        weighted_data: Precomputed (D, L, S, T) from _compute_weighted_data.
+            When provided, avoids redundant recomputation within the inner loop.
+    """
     N, D, S, T = data.shape
     L = settings["num_clusters"]
     dim = settings["dim"]
 
-    # s_t_nu is (D, L, T, S) but einsum needs matching index for S
-    # s_lambda is (N, L, S), data is (N, D, S, T)
+    if weighted_data is None:
+        weighted_data = _compute_weighted_data(data, params.s_lambda, S, T)
+
     for _ in range(50):  # Max M-step iterations
-        # Update kappa — vectorized over S, T
-        # dot products: sum_n,d data[n,d,s,t] * s_t_nu[d,l,t,s] * s_lambda[n,l,s]
-        # First compute data @ s_t_nu per (s,t): einsum for dot product
-        dots = np.einsum("ndst,dlts->nlst", data, params.s_t_nu)  # (N, L, S, T)
-        kappa_num = np.nansum(params.s_lambda[:, :, :, np.newaxis] * dots)
+        # Update kappa — accumulate directly without (N,L,S,T) intermediate
+        kappa_num = 0.0
+        for s in range(S):
+            sl = params.s_lambda[:, :, s]  # (N, L)
+            for t in range(T):
+                dot_st = data[:, :, s, t] @ params.s_t_nu[:, :, t, s]  # (N, L)
+                kappa_num += np.nansum(sl * dot_st)
         kappa_den = np.nansum(params.s_lambda)
 
         if kappa_den > 0:
@@ -208,11 +243,8 @@ def _m_step(
                 kappa_new = params.kappa[0]
             params.kappa = np.full(L, kappa_new)
 
-        # Update s_t_nu — vectorized over S, T
-        # weighted_data[d,l,s,t] = sum_n data[n,d,s,t] * s_lambda[n,l,s]
-        weighted_data = np.einsum("ndst,nls->dlst", data, params.s_lambda)
-        # lambda_X[d,l,t,s] = kappa[l] * weighted_data[d,l,s,t] + sigma[l] * s_psi[d,l,s]
-        # Note: need to transpose (s,t) -> (t,s) to match s_t_nu layout (D,L,T,S)
+        # Update s_t_nu using precomputed weighted_data
+        # lambda_X[d,l,t,s] = kappa * weighted_data[d,l,s,t] + sigma * s_psi[d,l,s]
         lambda_X = (
             params.kappa[np.newaxis, :, np.newaxis, np.newaxis]
             * weighted_data.transpose(0, 1, 3, 2)  # (D, L, T, S)
@@ -310,13 +342,11 @@ def intra_subject_var(
         all_converged = np.all(1 - cos_sim < epsilon)
         params.s_psi = s_psi_new
 
-        # Update sigma — vectorized with einsum
+        # Update sigma — vectorized with einsum + batch inv_ad
         # rbar[l] = mean over (s,t) of dot(s_psi[:,l,s], s_t_nu[:,l,t,s])
         rbar_all = np.einsum("dls,dlts->l", params.s_psi, params.s_t_nu) / (S * T)
-        sigma_new = np.zeros(L)
-        for l_idx in range(L):
-            rb = min(max(float(rbar_all[l_idx]), 1e-10), 1 - 1e-10)
-            sigma_new[l_idx] = inv_ad(dim, rb)
+        rbar_clamped = np.clip(rbar_all, 1e-10, 1 - 1e-10)
+        sigma_new = inv_ad_batch(dim, rbar_clamped)
 
         sigma_converged = (
             np.mean(np.abs(params.sigma - sigma_new)
@@ -349,15 +379,15 @@ def inter_subject_var(
     norms[norms == 0] = 1.0
     params.mu = mu_update / norms
 
-    # Update epsil — vectorized with einsum
+    # Update epsil — vectorized with einsum + batch inv_ad
     rbar_all = np.einsum("dls,dl->l", params.s_psi, params.mu) / S
-    for l_idx in range(L):
-        rb = min(max(float(rbar_all[l_idx]), 1e-10), 1 - 1e-10)
-        epsil_new = inv_ad(dim, rb)
-        epsil_new = max(epsil_new, c0)
-        if np.isinf(epsil_new):
-            epsil_new = params.epsil[l_idx]
-        params.epsil[l_idx] = epsil_new
+    rbar_clamped = np.clip(rbar_all, 1e-10, 1 - 1e-10)
+    epsil_new = inv_ad_batch(dim, rbar_clamped)
+    epsil_new = np.maximum(epsil_new, c0)
+    # Keep old values where result is inf
+    inf_mask = np.isinf(epsil_new)
+    epsil_new[inf_mask] = params.epsil[inf_mask]
+    params.epsil = epsil_new
 
     return params
 
@@ -420,13 +450,13 @@ def _compute_em_cost(
     """
     N, D, S, T = data.shape
     costs = np.zeros(S)
-    log_c = None
+    log_theta = np.log(np.maximum(params.theta, np.finfo(float).tiny))
+    log_c = None if log_vmf_cache is not None else cdln(params.kappa, settings["dim"])
+
     for s in range(S):
         if log_vmf_cache is not None:
             log_vmf_total = log_vmf_cache[s]
         else:
-            if log_c is None:
-                log_c = cdln(params.kappa, settings["dim"])
             log_vmf_total = np.zeros((N, settings["num_clusters"]))
             for t in range(T):
                 X = data[:, :, s, t]
@@ -435,7 +465,6 @@ def _compute_em_cost(
                 log_vmf_total += np.nan_to_num(lv, nan=0.0)
 
         sl = params.s_lambda[:, :, s]
-        log_theta = np.log(np.maximum(params.theta, np.finfo(float).tiny))
         log_sl = np.log(np.maximum(sl, np.finfo(float).tiny))
 
         costs[s] = np.nansum(sl * log_vmf_total) + np.nansum(sl * log_theta) - np.nansum(sl * log_sl)
