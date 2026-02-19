@@ -21,6 +21,10 @@ dev = [
     "pytest-cov",
 ]
 
+[project.scripts]
+pymshbm-extract-results = "pymshbm.cli.extract_results:main"
+pymshbm-wrapper = "pymshbm.cli.wrapper:main"
+
 [build-system]
 requires = ["uv_build>=0.9.18,<0.10.0"]
 build-backend = "uv_build"
