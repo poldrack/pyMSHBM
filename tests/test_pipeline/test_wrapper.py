@@ -7,16 +7,16 @@ import nibabel as nib
 import nibabel.freesurfer as fs
 import numpy as np
 import pytest
+import zarr
 
 from pymshbm.pipeline.wrapper import (
     _compute_initial_centroids,
     _load_profiles_tensor,
-    _profile_filename,
-    average_profiles_nifti,
+    average_profiles,
+    compute_profile,
     compute_seed_timeseries,
     create_profile_lists,
     discover_fmri_files,
-    generate_and_save_profile,
     parse_sub_list,
     run_wrapper,
 )
@@ -155,10 +155,11 @@ def test_compute_seed_timeseries_skips_label_zero():
 
 
 # ---------------------------------------------------------------------------
-# test_generate_and_save_profile
+# test_compute_profile
 # ---------------------------------------------------------------------------
 
-def test_generate_and_save_profile_creates_nifti(tmp_path):
+def test_compute_profile_returns_arrays(tmp_path):
+    """compute_profile should return (lh_profile, rh_profile) arrays."""
     rng = np.random.default_rng(42)
     n_vertices, n_timepoints, n_seeds = 20, 30, 5
 
@@ -174,37 +175,22 @@ def test_generate_and_save_profile_creates_nifti(tmp_path):
     seed_labels_lh = np.repeat(np.arange(1, n_seeds + 1), n_vertices // n_seeds)
     seed_labels_rh = np.repeat(np.arange(1, n_seeds + 1), n_vertices // n_seeds)
 
-    out_dir = tmp_path / "profiles"
-    generate_and_save_profile(
+    lh_profile, rh_profile = compute_profile(
         lh_fmri_path=lh_path,
         rh_fmri_path=rh_path,
         seed_labels_lh=seed_labels_lh,
         seed_labels_rh=seed_labels_rh,
-        out_dir=out_dir,
-        sub_idx=1,
-        sess_idx=1,
-        seed_mesh="fsaverage3",
-        targ_mesh="fsaverage6",
     )
 
-    # Check output files exist
-    lh_profile = (out_dir / "sub1" / "sess1" /
-                  "lh.sub1_sess1_fsaverage6_roifsaverage3.surf2surf_profile.nii.gz")
-    rh_profile = (out_dir / "sub1" / "sess1" /
-                  "rh.sub1_sess1_fsaverage6_roifsaverage3.surf2surf_profile.nii.gz")
-    assert lh_profile.exists()
-    assert rh_profile.exists()
-
-    # Load and check shape: (N_targ, N_seed) where N_seed = 2 * n_seeds (lh + rh)
-    lh_img = nib.load(str(lh_profile))
-    lh_profile_data = np.asarray(lh_img.dataobj)
     total_seeds = 2 * n_seeds
-    assert lh_profile_data.shape[0] == n_vertices
-    assert lh_profile_data.shape[-1] == total_seeds
+    assert lh_profile.shape == (n_vertices, total_seeds)
+    assert rh_profile.shape == (n_vertices, total_seeds)
+    assert np.all(np.isfinite(lh_profile))
+    assert np.all(np.isfinite(rh_profile))
 
 
 # ---------------------------------------------------------------------------
-# test_create_profile_lists
+# test_create_profile_lists (unchanged — MATLAB compat text files)
 # ---------------------------------------------------------------------------
 
 def test_create_profile_lists_content(tmp_path):
@@ -266,42 +252,41 @@ def test_create_profile_lists_unequal_sessions(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# test_average_profiles_nifti
+# test_average_profiles (Zarr-based)
 # ---------------------------------------------------------------------------
 
 def test_average_profiles_correct_values(tmp_path):
-    """Verify element-wise averaging across subjects/sessions."""
+    """Verify element-wise averaging from Zarr profiles store."""
     rng = np.random.default_rng(42)
-    n_vertices, n_seeds = 10, 4
+    n_targ, n_seeds = 10, 4
     n_subs, max_sess = 2, 2
-    profile_dir = tmp_path / "profiles"
-    seed_mesh, targ_mesh = "fsaverage3", "fsaverage6"
+    n_vertices = 2 * n_targ
 
-    all_profiles = []
-    for sub in range(1, n_subs + 1):
-        for sess in range(1, max_sess + 1):
-            for hemi in ("lh", "rh"):
-                data = rng.standard_normal((n_vertices, 1, 1, n_seeds))
-                p = (profile_dir / f"sub{sub}" / f"sess{sess}" /
-                     f"{hemi}.sub{sub}_sess{sess}_{targ_mesh}_roi{seed_mesh}.surf2surf_profile.nii.gz")
-                _write_nifti(p, data)
-                all_profiles.append((hemi, data.reshape(n_vertices, n_seeds)))
+    # Create a profiles Zarr store with known data
+    store_path = tmp_path / "fc_profiles.zarr"
+    profiles = zarr.open_array(
+        str(store_path), mode="w",
+        shape=(n_vertices, n_seeds, n_subs, max_sess),
+        chunks=(n_vertices, n_seeds, 1, 1),
+        dtype="float64", fill_value=float("nan"),
+    )
+    all_lh = []
+    for sub in range(n_subs):
+        for sess in range(max_sess):
+            data = rng.standard_normal((n_vertices, n_seeds))
+            profiles[:, :, sub, sess] = data
+            all_lh.append(data[:n_targ, :])
 
-    out_dir = tmp_path / "avg"
+    avg_path = tmp_path / "avg_profiles.zarr"
     sessions_per_sub = [max_sess, max_sess]
-    average_profiles_nifti(profile_dir, n_subs, sessions_per_sub, out_dir,
-                           seed_mesh, targ_mesh)
+    average_profiles(store_path, n_subs, sessions_per_sub, avg_path)
 
-    # Check output exists
-    avg_lh = out_dir / f"lh_{targ_mesh}_roi{seed_mesh}_avg_profile.nii.gz"
-    assert avg_lh.exists()
+    avg = zarr.open_array(str(avg_path), mode="r")[:]
+    assert avg.shape == (n_vertices, n_seeds)
 
-    # Verify averaging: collect all lh profiles and compute expected average
-    lh_profiles = [data for hemi, data in all_profiles if hemi == "lh"]
-    expected = np.mean(np.stack(lh_profiles), axis=0)
-    avg_img = nib.load(str(avg_lh))
-    avg_data = np.asarray(avg_img.dataobj).reshape(n_vertices, n_seeds)
-    np.testing.assert_allclose(avg_data, expected, atol=1e-5)
+    # Verify lh averaging
+    expected_lh = np.mean(np.stack(all_lh), axis=0)
+    np.testing.assert_allclose(avg[:n_targ, :], expected_lh, atol=1e-10)
 
 
 # ---------------------------------------------------------------------------
@@ -356,24 +341,19 @@ def test_run_wrapper_end_to_end(tmp_path):
     assert (fmri_list_dir / "lh_sub1_sess1.txt").exists()
     assert (fmri_list_dir / "rh_sub2_sess2.txt").exists()
 
-    # Profile files
+    # Zarr profiles store
     profiles_dir = gen_dir / "profiles"
-    assert (profiles_dir / "sub1" / "sess1").is_dir()
+    store_path = profiles_dir / "fc_profiles.zarr"
+    assert store_path.exists()
+    profiles = zarr.open_array(str(store_path), mode="r")
+    n_total_seeds = 2 * n_seeds  # lh + rh seeds
+    assert profiles.shape == (2 * n_vertices, n_total_seeds, 2, 2)
+    # All chunks should be written (no NaN)
+    assert not np.any(np.isnan(profiles[:]))
 
-    # Profile list files
-    test_set = (params_dir / "generate_individual_parcellations" /
-                "profile_list" / "test_set")
-    assert (test_set / "lh_sess1.txt").exists()
-
-    # Training set (copy)
-    training_set = (params_dir / "estimate_group_priors" /
-                    "profile_list" / "training_set")
-    assert (training_set / "lh_sess1.txt").exists()
-
-    # Average profiles
-    avg_dir = profiles_dir / "avg_profile"
-    assert (avg_dir / "lh_fsaverage6_roifsaverage3_avg_profile.nii.gz").exists()
-    assert (avg_dir / "rh_fsaverage6_roifsaverage3_avg_profile.nii.gz").exists()
+    # Average profiles Zarr
+    avg_path = profiles_dir / "avg_profiles.zarr"
+    assert avg_path.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -432,11 +412,10 @@ def test_run_wrapper_auto_seed_labels(tmp_path):
     )
 
     assert result_dir.exists()
-    # Verify profiles were created (proves seed labels were computed)
-    params_dir = result_dir / "Params_training"
-    profiles_dir = (params_dir / "generate_profiles_and_ini_params" /
-                    "profiles")
-    assert (profiles_dir / "sub1" / "sess1").is_dir()
+    # Verify Zarr profiles were created
+    profiles_dir = (result_dir / "Params_training" /
+                    "generate_profiles_and_ini_params" / "profiles")
+    assert (profiles_dir / "fc_profiles.zarr").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -505,23 +484,21 @@ def _setup_wrapper_with_precomputed_profiles(tmp_path, rng):
 
 
 def test_run_wrapper_skips_existing_profiles(tmp_path):
-    """Step 2 should skip profile generation when files already exist."""
+    """Step 2 should skip profile generation when Zarr chunk already exists."""
     rng = np.random.default_rng(42)
     csv_file, output_dir, seed_labels, n_vertices = \
         _setup_wrapper_with_precomputed_profiles(tmp_path, rng)
 
-    # Find the generated profile and record its mtime
     result_dir = list(output_dir.iterdir())[0]
     profiles_dir = (result_dir / "Params_training" /
                     "generate_profiles_and_ini_params" / "profiles")
-    lh_fname = _profile_filename("lh", 1, 1, "fsaverage6", "fsaverage3")
-    profile_path = profiles_dir / "sub1" / "sess1" / lh_fname
-    assert profile_path.exists()
-    original_mtime = profile_path.stat().st_mtime
+    store_path = profiles_dir / "fc_profiles.zarr"
+
+    # Record the data in the first chunk
+    profiles = zarr.open_array(str(store_path), mode="r")
+    original_data = profiles[:, :, 0, 0].copy()
 
     # Run again — profiles should NOT be regenerated
-    import time
-    time.sleep(0.05)  # ensure mtime would differ if file were rewritten
     run_wrapper(
         sub_list=csv_file,
         output_dir=output_dir,
@@ -530,11 +507,12 @@ def test_run_wrapper_skips_existing_profiles(tmp_path):
         seed_mesh="fsaverage3",
         targ_mesh="fsaverage6",
     )
-    assert profile_path.stat().st_mtime == original_mtime
+    profiles2 = zarr.open_array(str(store_path), mode="r")
+    np.testing.assert_array_equal(profiles2[:, :, 0, 0], original_data)
 
 
 def test_run_wrapper_overwrite_fc_regenerates_profiles(tmp_path):
-    """With overwrite_fc=True, profiles should be regenerated."""
+    """With overwrite_fc=True, Zarr store should be recreated."""
     rng = np.random.default_rng(42)
     csv_file, output_dir, seed_labels, n_vertices = \
         _setup_wrapper_with_precomputed_profiles(tmp_path, rng)
@@ -542,12 +520,12 @@ def test_run_wrapper_overwrite_fc_regenerates_profiles(tmp_path):
     result_dir = list(output_dir.iterdir())[0]
     profiles_dir = (result_dir / "Params_training" /
                     "generate_profiles_and_ini_params" / "profiles")
-    lh_fname = _profile_filename("lh", 1, 1, "fsaverage6", "fsaverage3")
-    profile_path = profiles_dir / "sub1" / "sess1" / lh_fname
-    original_mtime = profile_path.stat().st_mtime
+    store_path = profiles_dir / "fc_profiles.zarr"
 
     import time
+    original_mtime = store_path.stat().st_mtime
     time.sleep(0.05)
+
     run_wrapper(
         sub_list=csv_file,
         output_dir=output_dir,
@@ -557,7 +535,7 @@ def test_run_wrapper_overwrite_fc_regenerates_profiles(tmp_path):
         targ_mesh="fsaverage6",
         overwrite_fc=True,
     )
-    assert profile_path.stat().st_mtime > original_mtime
+    assert store_path.stat().st_mtime > original_mtime
 
 
 # ---------------------------------------------------------------------------
@@ -565,18 +543,18 @@ def test_run_wrapper_overwrite_fc_regenerates_profiles(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_run_wrapper_skips_existing_avg_profiles(tmp_path):
-    """Step 5 should skip averaging when avg profile files already exist."""
+    """Step 5 should skip averaging when avg Zarr already exists."""
     import time
     rng = np.random.default_rng(42)
     csv_file, output_dir, seed_labels, n_vertices = \
         _setup_wrapper_with_precomputed_profiles(tmp_path, rng)
 
     result_dir = list(output_dir.iterdir())[0]
-    avg_dir = (result_dir / "Params_training" /
-               "generate_profiles_and_ini_params" / "profiles" / "avg_profile")
-    avg_lh = avg_dir / "lh_fsaverage6_roifsaverage3_avg_profile.nii.gz"
-    assert avg_lh.exists()
-    original_mtime = avg_lh.stat().st_mtime
+    avg_path = (result_dir / "Params_training" /
+                "generate_profiles_and_ini_params" / "profiles" /
+                "avg_profiles.zarr")
+    assert avg_path.exists()
+    original_mtime = avg_path.stat().st_mtime
 
     time.sleep(0.05)
     run_wrapper(
@@ -587,21 +565,21 @@ def test_run_wrapper_skips_existing_avg_profiles(tmp_path):
         seed_mesh="fsaverage3",
         targ_mesh="fsaverage6",
     )
-    assert avg_lh.stat().st_mtime == original_mtime
+    assert avg_path.stat().st_mtime == original_mtime
 
 
 def test_run_wrapper_overwrite_fc_regenerates_avg_profiles(tmp_path):
-    """With overwrite_fc=True, avg profiles should be recomputed."""
+    """With overwrite_fc=True, avg Zarr should be recomputed."""
     import time
     rng = np.random.default_rng(42)
     csv_file, output_dir, seed_labels, n_vertices = \
         _setup_wrapper_with_precomputed_profiles(tmp_path, rng)
 
     result_dir = list(output_dir.iterdir())[0]
-    avg_dir = (result_dir / "Params_training" /
-               "generate_profiles_and_ini_params" / "profiles" / "avg_profile")
-    avg_lh = avg_dir / "lh_fsaverage6_roifsaverage3_avg_profile.nii.gz"
-    original_mtime = avg_lh.stat().st_mtime
+    avg_path = (result_dir / "Params_training" /
+                "generate_profiles_and_ini_params" / "profiles" /
+                "avg_profiles.zarr")
+    original_mtime = avg_path.stat().st_mtime
 
     time.sleep(0.05)
     run_wrapper(
@@ -613,32 +591,34 @@ def test_run_wrapper_overwrite_fc_regenerates_avg_profiles(tmp_path):
         targ_mesh="fsaverage6",
         overwrite_fc=True,
     )
-    assert avg_lh.stat().st_mtime > original_mtime
+    assert avg_path.stat().st_mtime > original_mtime
 
 
 # ---------------------------------------------------------------------------
 # Helpers for _load_profiles_tensor / _compute_initial_centroids tests
 # ---------------------------------------------------------------------------
 
-def _create_profile_niftis(
-    profile_dir: Path,
+def _create_profile_zarr(
+    store_path: Path,
     num_subs: int,
     sessions_per_sub: list[int],
     n_targ: int,
     n_seed: int,
-    targ_mesh: str,
-    seed_mesh: str,
     rng: np.random.Generator,
 ) -> None:
-    """Create synthetic profile NIfTI files matching wrapper layout."""
-    for sub in range(1, num_subs + 1):
-        for sess in range(1, sessions_per_sub[sub - 1] + 1):
-            for hemi in ("lh", "rh"):
-                fname = (f"{hemi}.sub{sub}_sess{sess}_{targ_mesh}"
-                         f"_roi{seed_mesh}.surf2surf_profile.nii.gz")
-                data = rng.standard_normal((n_targ, 1, 1, n_seed))
-                p = profile_dir / f"sub{sub}" / f"sess{sess}" / fname
-                _write_nifti(p, data)
+    """Create a synthetic Zarr profiles store."""
+    n_vertices = 2 * n_targ
+    max_sess = max(sessions_per_sub)
+    profiles = zarr.open_array(
+        str(store_path), mode="w",
+        shape=(n_vertices, n_seed, num_subs, max_sess),
+        chunks=(n_vertices, n_seed, 1, 1),
+        dtype="float64", fill_value=float("nan"),
+    )
+    for sub in range(num_subs):
+        for sess in range(sessions_per_sub[sub]):
+            data = rng.standard_normal((n_vertices, n_seed))
+            profiles[:, :, sub, sess] = data
 
 
 # ---------------------------------------------------------------------------
@@ -651,17 +631,12 @@ def test_load_profiles_tensor_shape(tmp_path):
     n_targ, n_seed = 10, 6
     sessions_per_sub = [2, 2]
     num_subs = 2
-    profile_dir = tmp_path / "profiles"
+    store_path = tmp_path / "fc_profiles.zarr"
 
-    _create_profile_niftis(
-        profile_dir, num_subs, sessions_per_sub,
-        n_targ, n_seed, "fsaverage6", "fsaverage3", rng,
-    )
+    _create_profile_zarr(store_path, num_subs, sessions_per_sub,
+                         n_targ, n_seed, rng)
 
-    tensor = _load_profiles_tensor(
-        profile_dir, num_subs, sessions_per_sub,
-        seed_mesh="fsaverage3", targ_mesh="fsaverage6",
-    )
+    tensor = _load_profiles_tensor(store_path, num_subs, sessions_per_sub)
     # N = 2 * n_targ (lh + rh), D = n_seed, S = num_subs, T = max sessions
     assert tensor.shape == (2 * n_targ, n_seed, num_subs, max(sessions_per_sub))
 
@@ -671,17 +646,12 @@ def test_load_profiles_tensor_row_normalized(tmp_path):
     rng = np.random.default_rng(42)
     n_targ, n_seed = 10, 6
     sessions_per_sub = [1]
-    profile_dir = tmp_path / "profiles"
+    store_path = tmp_path / "fc_profiles.zarr"
 
-    _create_profile_niftis(
-        profile_dir, 1, sessions_per_sub,
-        n_targ, n_seed, "fsaverage6", "fsaverage3", rng,
-    )
+    _create_profile_zarr(store_path, 1, sessions_per_sub,
+                         n_targ, n_seed, rng)
 
-    tensor = _load_profiles_tensor(
-        profile_dir, 1, sessions_per_sub,
-        seed_mesh="fsaverage3", targ_mesh="fsaverage6",
-    )
+    tensor = _load_profiles_tensor(store_path, 1, sessions_per_sub)
     # Check that non-zero rows have unit norm
     for s in range(tensor.shape[2]):
         for t in range(tensor.shape[3]):
@@ -696,19 +666,14 @@ def test_load_profiles_tensor_unequal_sessions(tmp_path):
     rng = np.random.default_rng(42)
     n_targ, n_seed = 10, 6
     sessions_per_sub = [2, 1]  # sub2 has only 1 session
-    profile_dir = tmp_path / "profiles"
+    store_path = tmp_path / "fc_profiles.zarr"
 
-    _create_profile_niftis(
-        profile_dir, 2, sessions_per_sub,
-        n_targ, n_seed, "fsaverage6", "fsaverage3", rng,
-    )
+    _create_profile_zarr(store_path, 2, sessions_per_sub,
+                         n_targ, n_seed, rng)
 
-    tensor = _load_profiles_tensor(
-        profile_dir, 2, sessions_per_sub,
-        seed_mesh="fsaverage3", targ_mesh="fsaverage6",
-    )
+    tensor = _load_profiles_tensor(store_path, 2, sessions_per_sub)
     assert tensor.shape == (2 * n_targ, n_seed, 2, 2)
-    # Sub2 session 2 should be all zeros
+    # Sub2 session 2 should be all zeros (NaN → 0 after loading)
     np.testing.assert_array_equal(tensor[:, :, 1, 1], 0.0)
     # Sub2 session 1 should NOT be all zeros
     assert np.any(tensor[:, :, 1, 0] != 0)
@@ -723,18 +688,14 @@ def test_compute_initial_centroids_shape(tmp_path):
     rng = np.random.default_rng(42)
     n_targ, n_seed = 20, 8
     num_clusters = 3
-    avg_dir = tmp_path / "avg_profile"
+    n_vertices = 2 * n_targ
 
-    # Create lh and rh averaged profile NIfTIs
-    for hemi in ("lh", "rh"):
-        data = rng.standard_normal((n_targ, 1, 1, n_seed)).astype(np.float32)
-        fname = f"{hemi}_fsaverage6_roifsaverage3_avg_profile.nii.gz"
-        _write_nifti(avg_dir / fname, data)
+    # Create avg profile Zarr
+    avg_path = tmp_path / "avg_profiles.zarr"
+    avg_data = rng.standard_normal((n_vertices, n_seed))
+    zarr.save(str(avg_path), avg_data)
 
-    centroids = _compute_initial_centroids(
-        avg_dir, num_clusters,
-        targ_mesh="fsaverage6", seed_mesh="fsaverage3",
-    )
+    centroids = _compute_initial_centroids(avg_path, num_clusters)
     assert centroids.shape == (n_seed, num_clusters)
     # Check columns are unit-norm
     norms = np.linalg.norm(centroids, axis=0)
@@ -901,10 +862,10 @@ def test_run_wrapper_saves_centroids(tmp_path):
             num_clusters=num_clusters,
         )
 
-    # Centroids file should exist in avg_profile dir
+    # Centroids file should exist next to avg Zarr
     profiles_dir = (result_dir / "Params_training" /
                     "generate_profiles_and_ini_params" / "profiles")
-    centroids_path = profiles_dir / "avg_profile" / f"g_mu_K{num_clusters}.npy"
+    centroids_path = profiles_dir / f"g_mu_K{num_clusters}.npy"
     assert centroids_path.exists()
     centroids = np.load(str(centroids_path))
     n_seeds = 2 * 5  # lh + rh seeds (5 each)
@@ -939,7 +900,7 @@ def test_run_wrapper_reuses_existing_centroids(tmp_path):
 
     profiles_dir = (result_dir / "Params_training" /
                     "generate_profiles_and_ini_params" / "profiles")
-    centroids_path = profiles_dir / "avg_profile" / f"g_mu_K{num_clusters}.npy"
+    centroids_path = profiles_dir / f"g_mu_K{num_clusters}.npy"
     original_mtime = centroids_path.stat().st_mtime
 
     time.sleep(0.05)
@@ -992,7 +953,7 @@ def test_run_wrapper_overwrite_kmeans_recomputes(tmp_path):
 
     profiles_dir = (result_dir / "Params_training" /
                     "generate_profiles_and_ini_params" / "profiles")
-    centroids_path = profiles_dir / "avg_profile" / f"g_mu_K{num_clusters}.npy"
+    centroids_path = profiles_dir / f"g_mu_K{num_clusters}.npy"
     original_mtime = centroids_path.stat().st_mtime
 
     time.sleep(0.05)

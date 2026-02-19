@@ -8,8 +8,8 @@ import logging
 import shutil
 from pathlib import Path
 
-import nibabel as nib
 import numpy as np
+import zarr
 
 from pymshbm.core.profiles import generate_ini_params, generate_profiles
 from pymshbm.io.cifti import write_dlabel_cifti
@@ -71,15 +71,34 @@ def compute_seed_timeseries(
     return result
 
 
-def _save_profile_nifti(path: Path, data: np.ndarray) -> None:
-    """Save a profile array as NIfTI with identity affine."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Store as (N_targ, 1, 1, N_seed) to match MATLAB layout
-    img = nib.Nifti1Image(
-        data.astype(np.float32).reshape(data.shape[0], 1, 1, data.shape[1]),
-        np.eye(4),
-    )
-    nib.save(img, str(path))
+def compute_profile(
+    lh_fmri_path: Path,
+    rh_fmri_path: Path,
+    seed_labels_lh: np.ndarray,
+    seed_labels_rh: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute FC profiles for one subject/session.
+
+    Returns:
+        (lh_profile, rh_profile) — each (N_targ, D) float arrays.
+    """
+    lh_bundle = read_fmri(lh_fmri_path)
+    rh_bundle = read_fmri(rh_fmri_path)
+
+    lh_data = lh_bundle.series
+    rh_data = rh_bundle.series
+
+    num_seeds_lh = int(seed_labels_lh.max())
+    num_seeds_rh = int(seed_labels_rh.max())
+
+    lh_seed_ts = compute_seed_timeseries(lh_data, seed_labels_lh, num_seeds_lh)
+    rh_seed_ts = compute_seed_timeseries(rh_data, seed_labels_rh, num_seeds_rh)
+    seed_ts = np.hstack([lh_seed_ts, rh_seed_ts])
+
+    lh_profile = generate_profiles(targ_data=lh_data.T, seed_data=seed_ts)
+    rh_profile = generate_profiles(targ_data=rh_data.T, seed_data=seed_ts)
+
+    return lh_profile, rh_profile
 
 
 def _profile_filename(hemi: str, sub_idx: int, sess_idx: int,
@@ -87,64 +106,6 @@ def _profile_filename(hemi: str, sub_idx: int, sess_idx: int,
     """Generate profile filename matching MATLAB convention."""
     return (f"{hemi}.sub{sub_idx}_sess{sess_idx}_{targ_mesh}"
             f"_roi{seed_mesh}.surf2surf_profile.nii.gz")
-
-
-def _profiles_exist(
-    profile_dir: Path, sub_idx: int, sess_idx: int,
-    targ_mesh: str, seed_mesh: str,
-) -> bool:
-    """Check whether both lh and rh profile files exist for a subject/session."""
-    sess_dir = profile_dir / f"sub{sub_idx}" / f"sess{sess_idx}"
-    lh = sess_dir / _profile_filename("lh", sub_idx, sess_idx, targ_mesh, seed_mesh)
-    rh = sess_dir / _profile_filename("rh", sub_idx, sess_idx, targ_mesh, seed_mesh)
-    return lh.exists() and rh.exists()
-
-
-def _avg_profiles_exist(avg_dir: Path, targ_mesh: str, seed_mesh: str) -> bool:
-    """Check whether both lh and rh averaged profile NIfTIs exist."""
-    lh = avg_dir / f"lh_{targ_mesh}_roi{seed_mesh}_avg_profile.nii.gz"
-    rh = avg_dir / f"rh_{targ_mesh}_roi{seed_mesh}_avg_profile.nii.gz"
-    return lh.exists() and rh.exists()
-
-
-def generate_and_save_profile(
-    lh_fmri_path: Path,
-    rh_fmri_path: Path,
-    seed_labels_lh: np.ndarray,
-    seed_labels_rh: np.ndarray,
-    out_dir: Path,
-    sub_idx: int,
-    sess_idx: int,
-    seed_mesh: str,
-    targ_mesh: str,
-) -> None:
-    """Generate FC profile for one subject/session and save as NIfTI."""
-    lh_bundle = read_fmri(lh_fmri_path)
-    rh_bundle = read_fmri(rh_fmri_path)
-
-    # series shape: (N_vertices, T)
-    lh_data = lh_bundle.series
-    rh_data = rh_bundle.series
-
-    num_seeds_lh = int(seed_labels_lh.max())
-    num_seeds_rh = int(seed_labels_rh.max())
-
-    # Compute seed time series from both hemispheres
-    lh_seed_ts = compute_seed_timeseries(lh_data, seed_labels_lh, num_seeds_lh)
-    rh_seed_ts = compute_seed_timeseries(rh_data, seed_labels_rh, num_seeds_rh)
-    # Concatenate seed time series: (T, num_seeds_lh + num_seeds_rh)
-    seed_ts = np.hstack([lh_seed_ts, rh_seed_ts])
-
-    # Generate profiles: target data needs to be (T, N_targ)
-    lh_profile = generate_profiles(targ_data=lh_data.T, seed_data=seed_ts)
-    rh_profile = generate_profiles(targ_data=rh_data.T, seed_data=seed_ts)
-
-    # Save
-    sess_dir = out_dir / f"sub{sub_idx}" / f"sess{sess_idx}"
-    lh_fname = _profile_filename("lh", sub_idx, sess_idx, targ_mesh, seed_mesh)
-    rh_fname = _profile_filename("rh", sub_idx, sess_idx, targ_mesh, seed_mesh)
-    _save_profile_nifti(sess_dir / lh_fname, lh_profile)
-    _save_profile_nifti(sess_dir / rh_fname, rh_profile)
 
 
 def create_profile_lists(
@@ -155,12 +116,7 @@ def create_profile_lists(
     seed_mesh: str,
     targ_mesh: str,
 ) -> None:
-    """Create per-session text files listing profile paths.
-
-    For each session, writes one file per hemisphere containing one line per
-    subject (the path to that subject's profile). Subjects with fewer sessions
-    get "NONE" entries.
-    """
+    """Create per-session text files listing profile paths (MATLAB compat)."""
     max_sess = max(sessions_per_sub)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -179,45 +135,144 @@ def create_profile_lists(
             write_profile_list(out_dir / f"{hemi}_sess{sess}.txt", paths)
 
 
-def average_profiles_nifti(
-    profile_dir: Path,
+def _open_profiles_zarr(
+    store_path: Path,
+    n_vertices: int,
+    n_seeds: int,
+    num_subs: int,
+    max_sessions: int,
+    overwrite: bool = False,
+) -> zarr.Array:
+    """Open or create the profiles Zarr array.
+
+    Shape: (N_vertices, D_seeds, S_subjects, T_max_sessions).
+    Chunks: one chunk per (subject, session). fill_value=NaN for
+    detecting unwritten chunks.
+    """
+    mode = "w" if overwrite else "a"
+    if not store_path.exists() or overwrite:
+        return zarr.open_array(
+            str(store_path), mode=mode,
+            shape=(n_vertices, n_seeds, num_subs, max_sessions),
+            chunks=(n_vertices, n_seeds, 1, 1),
+            dtype="float64",
+            fill_value=float("nan"),
+        )
+    return zarr.open_array(str(store_path), mode="r+")
+
+
+def _profile_chunk_written(profiles: zarr.Array, sub: int, sess: int) -> bool:
+    """Check if a profile chunk has been written (not NaN)."""
+    return np.isfinite(profiles[0, 0, sub, sess])
+
+
+def average_profiles(
+    store_path: Path,
     num_subs: int,
     sessions_per_sub: list[int],
-    out_dir: Path,
-    seed_mesh: str,
-    targ_mesh: str,
+    avg_path: Path,
 ) -> None:
-    """Average profiles across all subjects/sessions and save as NIfTI."""
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    """Average profiles from Zarr store and save as Zarr array.
 
-    for hemi in ("lh", "rh"):
-        profiles = []
-        expected = 0
-        for sub in range(1, num_subs + 1):
-            for sess in range(1, sessions_per_sub[sub - 1] + 1):
-                expected += 1
-                fname = _profile_filename(
-                    hemi, sub, sess, targ_mesh, seed_mesh)
-                p = profile_dir / f"sub{sub}" / f"sess{sess}" / fname
-                if p.exists():
-                    img = nib.load(str(p))
-                    data = np.asarray(img.dataobj, dtype=np.float32)
-                    # Flatten to (N_targ, N_seed)
-                    n_targ = data.shape[0]
-                    n_seed = data.shape[-1]
-                    profiles.append(data.reshape(n_targ, n_seed))
-                else:
-                    logger.warning("  %s profile missing: %s", hemi, p)
-        if profiles:
-            logger.info("  %s: averaging %d/%d profiles", hemi,
-                        len(profiles), expected)
-            avg = np.mean(np.stack(profiles), axis=0)
-            avg_fname = f"{hemi}_{targ_mesh}_roi{seed_mesh}_avg_profile.nii.gz"
-            _save_profile_nifti(out_dir / avg_fname, avg)
-        else:
-            logger.warning("  %s: no profile files found (expected %d) — "
-                           "skipping average", hemi, expected)
+    Computes element-wise mean across all valid subject/session slices.
+    """
+    profiles = zarr.open_array(str(store_path), mode="r")
+    data = profiles[:]  # (N, D, S, max_T)
+
+    # Collect all valid (sub, sess) slices and average
+    slices = []
+    for sub in range(num_subs):
+        for sess in range(sessions_per_sub[sub]):
+            slices.append(data[:, :, sub, sess])
+
+    avg = np.mean(np.stack(slices), axis=0)  # (N, D)
+    if avg_path.exists():
+        shutil.rmtree(avg_path)
+    zarr.save(str(avg_path), avg)
+
+
+def _row_normalize(arr: np.ndarray) -> np.ndarray:
+    """Normalize rows to unit length; zero rows stay zero."""
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return arr / norms
+
+
+def _load_profiles_tensor(
+    store_path: Path,
+    num_subs: int,
+    sessions_per_sub: list[int],
+) -> np.ndarray:
+    """Load profiles from Zarr and row-normalize.
+
+    Returns:
+        (N, D, S, max_T) float64, row-normalized. NaN → 0 for
+        unwritten sessions.
+    """
+    data = zarr.open_array(str(store_path), mode="r")[:]
+    data = np.nan_to_num(data, nan=0.0)
+
+    for s in range(num_subs):
+        for t in range(sessions_per_sub[s]):
+            data[:, :, s, t] = _row_normalize(data[:, :, s, t])
+
+    return data
+
+
+def _centroids_path(profiles_dir: Path, num_clusters: int) -> Path:
+    """Return the path where cached k-means centroids are stored."""
+    return profiles_dir / f"g_mu_K{num_clusters}.npy"
+
+
+def _compute_initial_centroids(
+    avg_path: Path,
+    num_clusters: int,
+    overwrite: bool = False,
+    cache_dir: Path | None = None,
+) -> np.ndarray:
+    """Compute initial group centroids via k-means on averaged profiles.
+
+    Results are cached to disk and reused on subsequent runs unless
+    *overwrite* is True.
+
+    Args:
+        avg_path: Path to averaged profiles Zarr array.
+        num_clusters: Number of clusters K.
+        overwrite: If True, recompute even when a cached file exists.
+        cache_dir: Directory for centroid cache file. Defaults to
+            avg_path's parent.
+
+    Returns:
+        (D, K) unit-normalized centroids.
+    """
+    if cache_dir is None:
+        cache_dir = avg_path.parent
+    cached = _centroids_path(cache_dir, num_clusters)
+    if not overwrite and cached.exists():
+        logger.info("  Reusing cached centroids from %s", cached)
+        return np.load(str(cached))
+
+    avg = zarr.open_array(str(avg_path), mode="r")[:]  # (N, D)
+    _, centroids = generate_ini_params(avg, num_clusters)
+    np.save(str(cached), centroids)
+    return centroids
+
+
+def _write_parcellations_cifti(
+    results: list[tuple[np.ndarray, np.ndarray]],
+    subject_ids: list[str],
+    num_vertices_lh: int,
+    num_vertices_rh: int,
+    output_dir: Path,
+) -> None:
+    """Write parcellation results as CIFTI dlabel files."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for (lh_labels, rh_labels), sid in zip(results, subject_ids):
+        out_path = output_dir / f"{sid}.dlabel.nii"
+        write_dlabel_cifti(
+            lh_labels, rh_labels, out_path,
+            num_vertices_lh, num_vertices_rh,
+        )
 
 
 def _create_directory_structure(base_dir: Path) -> dict[str, Path]:
@@ -238,122 +293,6 @@ def _create_directory_structure(base_dir: Path) -> dict[str, Path]:
     for d in dirs.values():
         d.mkdir(parents=True, exist_ok=True)
     return dirs
-
-
-def _load_profile_nifti(path: Path) -> np.ndarray:
-    """Load a profile NIfTI and reshape to (N_targ, D)."""
-    img = nib.load(str(path))
-    data = np.asarray(img.dataobj, dtype=np.float64)
-    n_targ = data.shape[0]
-    n_seed = data.shape[-1]
-    return data.reshape(n_targ, n_seed)
-
-
-def _row_normalize(arr: np.ndarray) -> np.ndarray:
-    """Normalize rows to unit length; zero rows stay zero."""
-    norms = np.linalg.norm(arr, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    return arr / norms
-
-
-def _load_profiles_tensor(
-    profile_dir: Path,
-    num_subs: int,
-    sessions_per_sub: list[int],
-    seed_mesh: str,
-    targ_mesh: str,
-) -> np.ndarray:
-    """Load all profiles into a (N, D, S, T) tensor for training.
-
-    Args:
-        profile_dir: Directory containing sub*/sess*/ profile NIfTIs.
-        num_subs: Number of subjects.
-        sessions_per_sub: Sessions per subject.
-        seed_mesh: Seed mesh identifier.
-        targ_mesh: Target mesh identifier.
-
-    Returns:
-        (N, D, S, max_T) float64, row-normalized. N = 2*N_targ (lh+rh).
-    """
-    max_sess = max(sessions_per_sub)
-
-    # Probe shape from first available profile
-    fname = _profile_filename("lh", 1, 1, targ_mesh, seed_mesh)
-    first = _load_profile_nifti(profile_dir / "sub1" / "sess1" / fname)
-    n_targ, n_seed = first.shape
-    n_vertices = 2 * n_targ
-
-    tensor = np.zeros((n_vertices, n_seed, num_subs, max_sess), dtype=np.float64)
-
-    for sub in range(1, num_subs + 1):
-        for sess in range(1, sessions_per_sub[sub - 1] + 1):
-            lh_fname = _profile_filename("lh", sub, sess, targ_mesh, seed_mesh)
-            rh_fname = _profile_filename("rh", sub, sess, targ_mesh, seed_mesh)
-            lh = _load_profile_nifti(profile_dir / f"sub{sub}" / f"sess{sess}" / lh_fname)
-            rh = _load_profile_nifti(profile_dir / f"sub{sub}" / f"sess{sess}" / rh_fname)
-            stacked = np.vstack([lh, rh])
-            tensor[:, :, sub - 1, sess - 1] = _row_normalize(stacked)
-
-    return tensor
-
-
-def _centroids_path(avg_profile_dir: Path, num_clusters: int) -> Path:
-    """Return the path where cached k-means centroids are stored."""
-    return avg_profile_dir / f"g_mu_K{num_clusters}.npy"
-
-
-def _compute_initial_centroids(
-    avg_profile_dir: Path,
-    num_clusters: int,
-    targ_mesh: str,
-    seed_mesh: str,
-    overwrite: bool = False,
-) -> np.ndarray:
-    """Compute initial group centroids via k-means on averaged profiles.
-
-    Results are cached to disk and reused on subsequent runs unless
-    *overwrite* is True.
-
-    Args:
-        avg_profile_dir: Directory containing lh/rh averaged profile NIfTIs.
-        num_clusters: Number of clusters K.
-        targ_mesh: Target mesh identifier.
-        seed_mesh: Seed mesh identifier.
-        overwrite: If True, recompute even when a cached file exists.
-
-    Returns:
-        (D, K) unit-normalized centroids.
-    """
-    cached = _centroids_path(avg_profile_dir, num_clusters)
-    if not overwrite and cached.exists():
-        logger.info("  Reusing cached centroids from %s", cached)
-        return np.load(str(cached))
-
-    lh_fname = f"lh_{targ_mesh}_roi{seed_mesh}_avg_profile.nii.gz"
-    rh_fname = f"rh_{targ_mesh}_roi{seed_mesh}_avg_profile.nii.gz"
-    lh = _load_profile_nifti(avg_profile_dir / lh_fname)
-    rh = _load_profile_nifti(avg_profile_dir / rh_fname)
-    stacked = np.vstack([lh, rh])
-    _, centroids = generate_ini_params(stacked, num_clusters)
-    np.save(str(cached), centroids)
-    return centroids
-
-
-def _write_parcellations_cifti(
-    results: list[tuple[np.ndarray, np.ndarray]],
-    subject_ids: list[str],
-    num_vertices_lh: int,
-    num_vertices_rh: int,
-    output_dir: Path,
-) -> None:
-    """Write parcellation results as CIFTI dlabel files."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    for (lh_labels, rh_labels), sid in zip(results, subject_ids):
-        out_path = output_dir / f"{sid}.dlabel.nii"
-        write_dlabel_cifti(
-            lh_labels, rh_labels, out_path,
-            num_vertices_lh, num_vertices_rh,
-        )
 
 
 def run_wrapper(
@@ -431,32 +370,43 @@ def run_wrapper(
             f"files match the --file-pattern."
         )
 
-    # Step 2: Generate profiles
+    # Determine profile dimensions
+    n_targ = len(seed_labels_lh)
+    n_vertices = 2 * n_targ
+    n_seeds = int(seed_labels_lh.max()) + int(seed_labels_rh.max())
+    max_sess = max(sessions_per_sub)
+
+    # Step 2: Generate profiles → Zarr store
     logger.info("Step 2/%d: Generating FC profiles", total_steps)
+    store_path = dirs["profiles"] / "fc_profiles.zarr"
+    profiles_zarr = _open_profiles_zarr(
+        store_path, n_vertices, n_seeds, len(subjects), max_sess,
+        overwrite=overwrite_fc,
+    )
+
     for sub_num, (subject_id, data_dir) in enumerate(subjects, start=1):
         lh_files, rh_files = discover_fmri_files(
             data_dir, subject_id, file_pattern)
         for sess_num, (lh_f, rh_f) in enumerate(
                 zip(lh_files, rh_files), start=1):
-            if not overwrite_fc and _profiles_exist(
-                    dirs["profiles"], sub_num, sess_num, targ_mesh, seed_mesh):
+            sub_idx = sub_num - 1
+            sess_idx = sess_num - 1
+            if not overwrite_fc and _profile_chunk_written(
+                    profiles_zarr, sub_idx, sess_idx):
                 logger.info("  %s session %d — reusing existing profiles",
                             subject_id, sess_num)
                 continue
             logger.info("  %s session %d", subject_id, sess_num)
-            generate_and_save_profile(
+            lh_profile, rh_profile = compute_profile(
                 lh_fmri_path=lh_f,
                 rh_fmri_path=rh_f,
                 seed_labels_lh=seed_labels_lh,
                 seed_labels_rh=seed_labels_rh,
-                out_dir=dirs["profiles"],
-                sub_idx=sub_num,
-                sess_idx=sess_num,
-                seed_mesh=seed_mesh,
-                targ_mesh=targ_mesh,
             )
+            stacked = np.vstack([lh_profile, rh_profile])
+            profiles_zarr[:, :, sub_idx, sess_idx] = stacked
 
-    # Step 3: Create profile list files
+    # Step 3: Create profile list files (MATLAB compat)
     logger.info("Step 3/%d: Creating profile list files", total_steps)
     create_profile_lists(
         dirs["profiles"], len(subjects), sessions_per_sub,
@@ -469,16 +419,15 @@ def run_wrapper(
                     dirs_exist_ok=True)
 
     # Step 5: Average profiles
-    avg_dir = dirs["profiles"] / "avg_profile"
-    if not overwrite_fc and _avg_profiles_exist(avg_dir, targ_mesh, seed_mesh):
+    avg_path = dirs["profiles"] / "avg_profiles.zarr"
+    if not overwrite_fc and avg_path.exists():
         logger.info("Step 5/%d: Reusing existing averaged profiles",
                     total_steps)
     else:
         logger.info("Step 5/%d: Averaging profiles across subjects/sessions",
                     total_steps)
-        average_profiles_nifti(
-            dirs["profiles"], len(subjects), sessions_per_sub,
-            avg_dir, seed_mesh, targ_mesh,
+        average_profiles(
+            store_path, len(subjects), sessions_per_sub, avg_path,
         )
 
     if num_clusters is not None:
@@ -488,16 +437,16 @@ def run_wrapper(
         logger.info("Step 6/%d: Loading profiles into training tensor",
                     total_steps)
         data = _load_profiles_tensor(
-            dirs["profiles"], len(subjects), sessions_per_sub,
-            seed_mesh, targ_mesh,
+            store_path, len(subjects), sessions_per_sub,
         )
 
         # Step 7: Compute initial centroids
         logger.info("Step 7/%d: Computing initial centroids via k-means",
                     total_steps)
         g_mu = _compute_initial_centroids(
-            avg_dir, num_clusters, targ_mesh, seed_mesh,
+            avg_path, num_clusters,
             overwrite=overwrite_kmeans,
+            cache_dir=dirs["profiles"],
         )
 
         # Step 8: Run training (group prior estimation)
