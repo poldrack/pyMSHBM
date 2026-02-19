@@ -67,3 +67,71 @@ def compute_seed_labels(
     _, nearest_indices = tree.query(targ_coords)
 
     return (nearest_indices + 1).astype(np.int32)
+
+
+def load_surface_neighborhood(
+    targ_mesh: str,
+    freesurfer_dir: str | Path | None = None,
+) -> np.ndarray:
+    """Build combined lh+rh neighborhood matrix from surface faces.
+
+    Args:
+        targ_mesh: Target mesh name (e.g. "fsaverage6").
+        freesurfer_dir: FreeSurfer subjects directory.
+
+    Returns:
+        (N_lh + N_rh, max_neighbors) int64 array, -1 = invalid.
+    """
+    subjects_dir = _resolve_subjects_dir(freesurfer_dir)
+
+    lh_path = subjects_dir / targ_mesh / "surf" / "lh.sphere.reg"
+    rh_path = subjects_dir / targ_mesh / "surf" / "rh.sphere.reg"
+    if not lh_path.exists():
+        raise FileNotFoundError(f"Surface not found: {lh_path}")
+    if not rh_path.exists():
+        raise FileNotFoundError(f"Surface not found: {rh_path}")
+
+    lh_coords, lh_faces = fs.read_geometry(str(lh_path))
+    rh_coords, rh_faces = fs.read_geometry(str(rh_path))
+    n_lh = lh_coords.shape[0]
+    n_rh = rh_coords.shape[0]
+
+    lh_adj = _faces_to_adjacency(lh_faces, n_lh)
+    rh_adj = _faces_to_adjacency(rh_faces, n_rh)
+
+    # Offset rh indices by n_lh
+    rh_adj_offset = {
+        k + n_lh: {v + n_lh for v in neighbors}
+        for k, neighbors in rh_adj.items()
+    }
+
+    # Combine and build matrix
+    combined = {**lh_adj, **rh_adj_offset}
+    return _adjacency_to_neighborhood(combined, n_lh + n_rh)
+
+
+def _faces_to_adjacency(
+    faces: np.ndarray, num_vertices: int,
+) -> dict[int, set[int]]:
+    """Build adjacency dict from triangle faces."""
+    adj: dict[int, set[int]] = {i: set() for i in range(num_vertices)}
+    for f in faces:
+        for i in range(3):
+            for j in range(3):
+                if i != j:
+                    adj[int(f[i])].add(int(f[j]))
+    return adj
+
+
+def _adjacency_to_neighborhood(
+    adj: dict[int, set[int]], num_vertices: int,
+) -> np.ndarray:
+    """Convert adjacency dict to (N, max_nb) neighborhood array."""
+    max_nb = max((len(s) for s in adj.values()), default=0)
+    if max_nb == 0:
+        return np.full((num_vertices, 1), -1, dtype=np.int64)
+    neighborhood = np.full((num_vertices, max_nb), -1, dtype=np.int64)
+    for i, neighbors in adj.items():
+        for j, nb in enumerate(sorted(neighbors)):
+            neighborhood[i, j] = nb
+    return neighborhood

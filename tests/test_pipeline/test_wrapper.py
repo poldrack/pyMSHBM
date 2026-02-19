@@ -1,6 +1,7 @@
 """Tests for the MSHBM wrapper pipeline."""
 
 from pathlib import Path
+from unittest.mock import patch
 
 import nibabel as nib
 import nibabel.freesurfer as fs
@@ -8,6 +9,9 @@ import numpy as np
 import pytest
 
 from pymshbm.pipeline.wrapper import (
+    _compute_initial_centroids,
+    _load_profiles_tensor,
+    _profile_filename,
     average_profiles_nifti,
     compute_seed_timeseries,
     create_profile_lists,
@@ -433,3 +437,526 @@ def test_run_wrapper_auto_seed_labels(tmp_path):
     profiles_dir = (params_dir / "generate_profiles_and_ini_params" /
                     "profiles")
     assert (profiles_dir / "sub1" / "sess1").is_dir()
+
+
+# ---------------------------------------------------------------------------
+# test_run_wrapper_no_fmri_files_raises
+# ---------------------------------------------------------------------------
+
+def test_run_wrapper_no_fmri_files_raises(tmp_path):
+    """Pipeline should raise ValueError when no fMRI files match."""
+    n_seeds = 5
+    n_vertices = 20
+
+    # Create subject dirs but no fMRI files inside them
+    data_dir = tmp_path / "data"
+    (data_dir / "sub001").mkdir(parents=True)
+
+    csv_file = tmp_path / "subs.csv"
+    csv_file.write_text(
+        "subject_id,data_dir\n"
+        f"sub001,{data_dir}/\n"
+    )
+
+    seed_labels = np.repeat(np.arange(1, n_seeds + 1),
+                             n_vertices // n_seeds).astype(np.int32)
+
+    with pytest.raises(ValueError, match="No fMRI files found"):
+        run_wrapper(
+            sub_list=csv_file,
+            output_dir=tmp_path / "output",
+            seed_labels_lh=seed_labels,
+            seed_labels_rh=seed_labels,
+        )
+
+
+# ---------------------------------------------------------------------------
+# test_run_wrapper_skips_existing_profiles / overwrite_fc
+# ---------------------------------------------------------------------------
+
+def _setup_wrapper_with_precomputed_profiles(tmp_path, rng):
+    """Set up wrapper data and pre-create profile files with known mtime."""
+    n_vertices, n_timepoints, n_seeds = 20, 30, 5
+    data_dir = tmp_path / "data"
+    _make_fmri_files(data_dir, "sub001", n_sess=1,
+                     n_vertices=n_vertices, n_timepoints=n_timepoints,
+                     rng=rng)
+
+    csv_file = tmp_path / "subs.csv"
+    csv_file.write_text(
+        "subject_id,data_dir\n"
+        f"sub001,{data_dir}/\n"
+    )
+
+    seed_labels = np.repeat(np.arange(1, n_seeds + 1),
+                             n_vertices // n_seeds).astype(np.int32)
+
+    # Run wrapper once to generate profiles
+    output_dir = tmp_path / "output"
+    run_wrapper(
+        sub_list=csv_file,
+        output_dir=output_dir,
+        seed_labels_lh=seed_labels,
+        seed_labels_rh=seed_labels,
+        seed_mesh="fsaverage3",
+        targ_mesh="fsaverage6",
+    )
+    return csv_file, output_dir, seed_labels, n_vertices
+
+
+def test_run_wrapper_skips_existing_profiles(tmp_path):
+    """Step 2 should skip profile generation when files already exist."""
+    rng = np.random.default_rng(42)
+    csv_file, output_dir, seed_labels, n_vertices = \
+        _setup_wrapper_with_precomputed_profiles(tmp_path, rng)
+
+    # Find the generated profile and record its mtime
+    result_dir = list(output_dir.iterdir())[0]
+    profiles_dir = (result_dir / "Params_training" /
+                    "generate_profiles_and_ini_params" / "profiles")
+    lh_fname = _profile_filename("lh", 1, 1, "fsaverage6", "fsaverage3")
+    profile_path = profiles_dir / "sub1" / "sess1" / lh_fname
+    assert profile_path.exists()
+    original_mtime = profile_path.stat().st_mtime
+
+    # Run again — profiles should NOT be regenerated
+    import time
+    time.sleep(0.05)  # ensure mtime would differ if file were rewritten
+    run_wrapper(
+        sub_list=csv_file,
+        output_dir=output_dir,
+        seed_labels_lh=seed_labels,
+        seed_labels_rh=seed_labels,
+        seed_mesh="fsaverage3",
+        targ_mesh="fsaverage6",
+    )
+    assert profile_path.stat().st_mtime == original_mtime
+
+
+def test_run_wrapper_overwrite_fc_regenerates_profiles(tmp_path):
+    """With overwrite_fc=True, profiles should be regenerated."""
+    rng = np.random.default_rng(42)
+    csv_file, output_dir, seed_labels, n_vertices = \
+        _setup_wrapper_with_precomputed_profiles(tmp_path, rng)
+
+    result_dir = list(output_dir.iterdir())[0]
+    profiles_dir = (result_dir / "Params_training" /
+                    "generate_profiles_and_ini_params" / "profiles")
+    lh_fname = _profile_filename("lh", 1, 1, "fsaverage6", "fsaverage3")
+    profile_path = profiles_dir / "sub1" / "sess1" / lh_fname
+    original_mtime = profile_path.stat().st_mtime
+
+    import time
+    time.sleep(0.05)
+    run_wrapper(
+        sub_list=csv_file,
+        output_dir=output_dir,
+        seed_labels_lh=seed_labels,
+        seed_labels_rh=seed_labels,
+        seed_mesh="fsaverage3",
+        targ_mesh="fsaverage6",
+        overwrite_fc=True,
+    )
+    assert profile_path.stat().st_mtime > original_mtime
+
+
+# ---------------------------------------------------------------------------
+# Helpers for _load_profiles_tensor / _compute_initial_centroids tests
+# ---------------------------------------------------------------------------
+
+def _create_profile_niftis(
+    profile_dir: Path,
+    num_subs: int,
+    sessions_per_sub: list[int],
+    n_targ: int,
+    n_seed: int,
+    targ_mesh: str,
+    seed_mesh: str,
+    rng: np.random.Generator,
+) -> None:
+    """Create synthetic profile NIfTI files matching wrapper layout."""
+    for sub in range(1, num_subs + 1):
+        for sess in range(1, sessions_per_sub[sub - 1] + 1):
+            for hemi in ("lh", "rh"):
+                fname = (f"{hemi}.sub{sub}_sess{sess}_{targ_mesh}"
+                         f"_roi{seed_mesh}.surf2surf_profile.nii.gz")
+                data = rng.standard_normal((n_targ, 1, 1, n_seed))
+                p = profile_dir / f"sub{sub}" / f"sess{sess}" / fname
+                _write_nifti(p, data)
+
+
+# ---------------------------------------------------------------------------
+# test__load_profiles_tensor
+# ---------------------------------------------------------------------------
+
+def test_load_profiles_tensor_shape(tmp_path):
+    """Output shape should be (2*N_targ, D, S, max_T)."""
+    rng = np.random.default_rng(42)
+    n_targ, n_seed = 10, 6
+    sessions_per_sub = [2, 2]
+    num_subs = 2
+    profile_dir = tmp_path / "profiles"
+
+    _create_profile_niftis(
+        profile_dir, num_subs, sessions_per_sub,
+        n_targ, n_seed, "fsaverage6", "fsaverage3", rng,
+    )
+
+    tensor = _load_profiles_tensor(
+        profile_dir, num_subs, sessions_per_sub,
+        seed_mesh="fsaverage3", targ_mesh="fsaverage6",
+    )
+    # N = 2 * n_targ (lh + rh), D = n_seed, S = num_subs, T = max sessions
+    assert tensor.shape == (2 * n_targ, n_seed, num_subs, max(sessions_per_sub))
+
+
+def test_load_profiles_tensor_row_normalized(tmp_path):
+    """Non-zero rows should be unit vectors."""
+    rng = np.random.default_rng(42)
+    n_targ, n_seed = 10, 6
+    sessions_per_sub = [1]
+    profile_dir = tmp_path / "profiles"
+
+    _create_profile_niftis(
+        profile_dir, 1, sessions_per_sub,
+        n_targ, n_seed, "fsaverage6", "fsaverage3", rng,
+    )
+
+    tensor = _load_profiles_tensor(
+        profile_dir, 1, sessions_per_sub,
+        seed_mesh="fsaverage3", targ_mesh="fsaverage6",
+    )
+    # Check that non-zero rows have unit norm
+    for s in range(tensor.shape[2]):
+        for t in range(tensor.shape[3]):
+            col = tensor[:, :, s, t]
+            norms = np.linalg.norm(col, axis=1)
+            nonzero = norms > 0
+            np.testing.assert_allclose(norms[nonzero], 1.0, atol=1e-6)
+
+
+def test_load_profiles_tensor_unequal_sessions(tmp_path):
+    """Missing sessions should be zero-padded."""
+    rng = np.random.default_rng(42)
+    n_targ, n_seed = 10, 6
+    sessions_per_sub = [2, 1]  # sub2 has only 1 session
+    profile_dir = tmp_path / "profiles"
+
+    _create_profile_niftis(
+        profile_dir, 2, sessions_per_sub,
+        n_targ, n_seed, "fsaverage6", "fsaverage3", rng,
+    )
+
+    tensor = _load_profiles_tensor(
+        profile_dir, 2, sessions_per_sub,
+        seed_mesh="fsaverage3", targ_mesh="fsaverage6",
+    )
+    assert tensor.shape == (2 * n_targ, n_seed, 2, 2)
+    # Sub2 session 2 should be all zeros
+    np.testing.assert_array_equal(tensor[:, :, 1, 1], 0.0)
+    # Sub2 session 1 should NOT be all zeros
+    assert np.any(tensor[:, :, 1, 0] != 0)
+
+
+# ---------------------------------------------------------------------------
+# test__compute_initial_centroids
+# ---------------------------------------------------------------------------
+
+def test_compute_initial_centroids_shape(tmp_path):
+    """Centroids should be (D, K) with unit-norm columns."""
+    rng = np.random.default_rng(42)
+    n_targ, n_seed = 20, 8
+    num_clusters = 3
+    avg_dir = tmp_path / "avg_profile"
+
+    # Create lh and rh averaged profile NIfTIs
+    for hemi in ("lh", "rh"):
+        data = rng.standard_normal((n_targ, 1, 1, n_seed)).astype(np.float32)
+        fname = f"{hemi}_fsaverage6_roifsaverage3_avg_profile.nii.gz"
+        _write_nifti(avg_dir / fname, data)
+
+    centroids = _compute_initial_centroids(
+        avg_dir, num_clusters,
+        targ_mesh="fsaverage6", seed_mesh="fsaverage3",
+    )
+    assert centroids.shape == (n_seed, num_clusters)
+    # Check columns are unit-norm
+    norms = np.linalg.norm(centroids, axis=0)
+    np.testing.assert_allclose(norms, 1.0, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# test_run_wrapper with num_clusters (training + CIFTI)
+# ---------------------------------------------------------------------------
+
+def _make_mock_params(n_vertices, num_clusters, num_subs):
+    """Build a mock MSHBMParams with valid s_lambda for extraction."""
+    from pymshbm.types import MSHBMParams
+    N = 2 * n_vertices
+    D = 10
+    L = num_clusters
+    S = num_subs
+    rng = np.random.default_rng(99)
+    s_lambda = rng.random((N, L, S))
+    # Normalize to look like posterior probs
+    s_lambda /= s_lambda.sum(axis=1, keepdims=True)
+    return MSHBMParams(
+        mu=rng.random((D, L)),
+        epsil=rng.random(L),
+        sigma=rng.random(L),
+        theta=rng.random((N, L)),
+        kappa=rng.random(L),
+        s_lambda=s_lambda,
+        s_psi=rng.random((D, L, S)),
+        s_t_nu=rng.random((D, L, 1, S)),
+        iter_inter=5,
+        record=[1.0, 2.0],
+    )
+
+
+def _mock_parcellation(data, group_priors, neighborhood, w=200.0, c=50.0,
+                       max_iter=50):
+    """Mock parcellation_single_subject that returns random labels."""
+    n_vertices = data.shape[0] // 2
+    rng = np.random.default_rng(42)
+    lh = rng.integers(0, 4, size=n_vertices).astype(np.int32)
+    rh = rng.integers(0, 4, size=n_vertices).astype(np.int32)
+    return lh, rh
+
+
+def _setup_num_clusters_run(tmp_path, rng, n_vertices=20, n_timepoints=30,
+                            n_seeds=5, num_clusters=3, n_subs=2, n_sess=2):
+    """Set up data and mocks for a num_clusters wrapper run."""
+    data_dir = tmp_path / "data"
+    sub_ids = [f"sub{i:03d}" for i in range(1, n_subs + 1)]
+    for sub_id in sub_ids:
+        _make_fmri_files(data_dir, sub_id, n_sess=n_sess,
+                         n_vertices=n_vertices, n_timepoints=n_timepoints,
+                         rng=rng)
+
+    csv_file = tmp_path / "subs.csv"
+    lines = ["subject_id,data_dir\n"]
+    for sub_id in sub_ids:
+        lines.append(f"{sub_id},{data_dir}/\n")
+    csv_file.write_text("".join(lines))
+
+    seed_labels = np.repeat(np.arange(1, n_seeds + 1),
+                             n_vertices // n_seeds).astype(np.int32)
+
+    mock_params = _make_mock_params(n_vertices, num_clusters, n_subs)
+    mock_nb = np.full((2 * n_vertices, 3), -1, dtype=np.int64)
+
+    return csv_file, seed_labels, mock_params, mock_nb
+
+
+def test_run_wrapper_with_num_clusters(tmp_path):
+    """End-to-end pipeline with training + CIFTI output."""
+    rng = np.random.default_rng(42)
+    num_clusters = 3
+    csv_file, seed_labels, mock_params, mock_nb = _setup_num_clusters_run(
+        tmp_path, rng, num_clusters=num_clusters,
+    )
+
+    with patch("pymshbm.pipeline.wrapper.params_training",
+               return_value=mock_params), \
+         patch("pymshbm.pipeline.wrapper.parcellation_single_subject",
+               side_effect=_mock_parcellation), \
+         patch("pymshbm.pipeline.wrapper.load_surface_neighborhood",
+               return_value=mock_nb):
+        result_dir = run_wrapper(
+            sub_list=csv_file,
+            output_dir=tmp_path / "output",
+            seed_labels_lh=seed_labels,
+            seed_labels_rh=seed_labels,
+            seed_mesh="fsaverage3",
+            targ_mesh="fsaverage6",
+            num_clusters=num_clusters,
+        )
+
+    # Check that CIFTI parcellations exist
+    cifti_dir = result_dir / "cifti_parcellations"
+    assert cifti_dir.exists()
+    for sub_id in ("sub001", "sub002"):
+        dlabel = cifti_dir / f"{sub_id}.dlabel.nii"
+        assert dlabel.exists(), f"Missing {dlabel}"
+        img = nib.load(str(dlabel))
+        assert isinstance(img, nib.Cifti2Image)
+
+
+def test_run_wrapper_without_num_clusters_skips_training(tmp_path):
+    """When num_clusters is not provided, no training artifacts should exist."""
+    rng = np.random.default_rng(42)
+    n_vertices, n_timepoints, n_seeds = 20, 30, 5
+
+    data_dir = tmp_path / "data"
+    _make_fmri_files(data_dir, "sub001", n_sess=1,
+                     n_vertices=n_vertices, n_timepoints=n_timepoints,
+                     rng=rng)
+
+    csv_file = tmp_path / "subs.csv"
+    csv_file.write_text(
+        "subject_id,data_dir\n"
+        f"sub001,{data_dir}/\n"
+    )
+
+    seed_labels = np.repeat(np.arange(1, n_seeds + 1),
+                             n_vertices // n_seeds).astype(np.int32)
+
+    result_dir = run_wrapper(
+        sub_list=csv_file,
+        output_dir=tmp_path / "output",
+        seed_labels_lh=seed_labels,
+        seed_labels_rh=seed_labels,
+        seed_mesh="fsaverage3",
+        targ_mesh="fsaverage6",
+    )
+
+    # No CIFTI dir should exist
+    assert not (result_dir / "cifti_parcellations").exists()
+    # No Params_Final.mat
+    assert not (result_dir / "priors" / "Params_Final.mat").exists()
+
+
+# ---------------------------------------------------------------------------
+# test_run_wrapper centroid caching (--overwrite-kmeans)
+# ---------------------------------------------------------------------------
+
+def test_run_wrapper_saves_centroids(tmp_path):
+    """Step 7 should save centroids to a .npy file."""
+    rng = np.random.default_rng(42)
+    num_clusters = 3
+    csv_file, seed_labels, mock_params, mock_nb = _setup_num_clusters_run(
+        tmp_path, rng, num_clusters=num_clusters,
+    )
+
+    with patch("pymshbm.pipeline.wrapper.params_training",
+               return_value=mock_params), \
+         patch("pymshbm.pipeline.wrapper.parcellation_single_subject",
+               side_effect=_mock_parcellation), \
+         patch("pymshbm.pipeline.wrapper.load_surface_neighborhood",
+               return_value=mock_nb):
+        result_dir = run_wrapper(
+            sub_list=csv_file,
+            output_dir=tmp_path / "output",
+            seed_labels_lh=seed_labels,
+            seed_labels_rh=seed_labels,
+            seed_mesh="fsaverage3",
+            targ_mesh="fsaverage6",
+            num_clusters=num_clusters,
+        )
+
+    # Centroids file should exist in avg_profile dir
+    profiles_dir = (result_dir / "Params_training" /
+                    "generate_profiles_and_ini_params" / "profiles")
+    centroids_path = profiles_dir / "avg_profile" / f"g_mu_K{num_clusters}.npy"
+    assert centroids_path.exists()
+    centroids = np.load(str(centroids_path))
+    n_seeds = 2 * 5  # lh + rh seeds (5 each)
+    assert centroids.shape == (n_seeds, num_clusters)
+
+
+def test_run_wrapper_reuses_existing_centroids(tmp_path):
+    """Step 7 should reuse saved centroids instead of recomputing."""
+    import time
+    rng = np.random.default_rng(42)
+    num_clusters = 3
+    csv_file, seed_labels, mock_params, mock_nb = _setup_num_clusters_run(
+        tmp_path, rng, num_clusters=num_clusters,
+    )
+
+    # First run to generate centroids
+    with patch("pymshbm.pipeline.wrapper.params_training",
+               return_value=mock_params), \
+         patch("pymshbm.pipeline.wrapper.parcellation_single_subject",
+               side_effect=_mock_parcellation), \
+         patch("pymshbm.pipeline.wrapper.load_surface_neighborhood",
+               return_value=mock_nb):
+        result_dir = run_wrapper(
+            sub_list=csv_file,
+            output_dir=tmp_path / "output",
+            seed_labels_lh=seed_labels,
+            seed_labels_rh=seed_labels,
+            seed_mesh="fsaverage3",
+            targ_mesh="fsaverage6",
+            num_clusters=num_clusters,
+        )
+
+    profiles_dir = (result_dir / "Params_training" /
+                    "generate_profiles_and_ini_params" / "profiles")
+    centroids_path = profiles_dir / "avg_profile" / f"g_mu_K{num_clusters}.npy"
+    original_mtime = centroids_path.stat().st_mtime
+
+    time.sleep(0.05)
+
+    # Second run — centroids should NOT be recomputed
+    with patch("pymshbm.pipeline.wrapper.params_training",
+               return_value=mock_params), \
+         patch("pymshbm.pipeline.wrapper.parcellation_single_subject",
+               side_effect=_mock_parcellation), \
+         patch("pymshbm.pipeline.wrapper.load_surface_neighborhood",
+               return_value=mock_nb):
+        run_wrapper(
+            sub_list=csv_file,
+            output_dir=tmp_path / "output",
+            seed_labels_lh=seed_labels,
+            seed_labels_rh=seed_labels,
+            seed_mesh="fsaverage3",
+            targ_mesh="fsaverage6",
+            num_clusters=num_clusters,
+        )
+
+    assert centroids_path.stat().st_mtime == original_mtime
+
+
+def test_run_wrapper_overwrite_kmeans_recomputes(tmp_path):
+    """With overwrite_kmeans=True, centroids should be recomputed."""
+    import time
+    rng = np.random.default_rng(42)
+    num_clusters = 3
+    csv_file, seed_labels, mock_params, mock_nb = _setup_num_clusters_run(
+        tmp_path, rng, num_clusters=num_clusters,
+    )
+
+    # First run
+    with patch("pymshbm.pipeline.wrapper.params_training",
+               return_value=mock_params), \
+         patch("pymshbm.pipeline.wrapper.parcellation_single_subject",
+               side_effect=_mock_parcellation), \
+         patch("pymshbm.pipeline.wrapper.load_surface_neighborhood",
+               return_value=mock_nb):
+        result_dir = run_wrapper(
+            sub_list=csv_file,
+            output_dir=tmp_path / "output",
+            seed_labels_lh=seed_labels,
+            seed_labels_rh=seed_labels,
+            seed_mesh="fsaverage3",
+            targ_mesh="fsaverage6",
+            num_clusters=num_clusters,
+        )
+
+    profiles_dir = (result_dir / "Params_training" /
+                    "generate_profiles_and_ini_params" / "profiles")
+    centroids_path = profiles_dir / "avg_profile" / f"g_mu_K{num_clusters}.npy"
+    original_mtime = centroids_path.stat().st_mtime
+
+    time.sleep(0.05)
+
+    # Second run with overwrite_kmeans=True
+    with patch("pymshbm.pipeline.wrapper.params_training",
+               return_value=mock_params), \
+         patch("pymshbm.pipeline.wrapper.parcellation_single_subject",
+               side_effect=_mock_parcellation), \
+         patch("pymshbm.pipeline.wrapper.load_surface_neighborhood",
+               return_value=mock_nb):
+        run_wrapper(
+            sub_list=csv_file,
+            output_dir=tmp_path / "output",
+            seed_labels_lh=seed_labels,
+            seed_labels_rh=seed_labels,
+            seed_mesh="fsaverage3",
+            targ_mesh="fsaverage6",
+            num_clusters=num_clusters,
+            overwrite_kmeans=True,
+        )
+
+    assert centroids_path.stat().st_mtime > original_mtime

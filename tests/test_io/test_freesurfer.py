@@ -6,7 +6,7 @@ import nibabel.freesurfer as fs
 import numpy as np
 import pytest
 
-from pymshbm.io.freesurfer import compute_seed_labels
+from pymshbm.io.freesurfer import compute_seed_labels, load_surface_neighborhood
 
 
 def _make_sphere_surface(subjects_dir: Path, mesh: str, hemi: str,
@@ -201,3 +201,47 @@ def test_compute_seed_labels_no_dir_no_env(monkeypatch):
             targ_mesh="fsaverage6",
             hemi="lh",
         )
+
+
+# ---------------------------------------------------------------------------
+# test_load_surface_neighborhood
+# ---------------------------------------------------------------------------
+
+def test_load_surface_neighborhood_shape(tmp_path):
+    """Combined lh+rh neighborhood should have N_lh + N_rh rows."""
+    n_lh, n_rh = 20, 20
+    _make_sphere_surface(tmp_path, "fsaverage6", "lh", n_lh)
+    _make_sphere_surface(tmp_path, "fsaverage6", "rh", n_rh)
+
+    nb = load_surface_neighborhood("fsaverage6", freesurfer_dir=tmp_path)
+    assert nb.shape[0] == n_lh + n_rh
+    assert nb.ndim == 2
+
+
+def test_load_surface_neighborhood_valid_indices(tmp_path):
+    """All non-padding entries should be valid vertex indices."""
+    n_lh, n_rh = 20, 20
+    _make_sphere_surface(tmp_path, "fsaverage6", "lh", n_lh)
+    _make_sphere_surface(tmp_path, "fsaverage6", "rh", n_rh)
+
+    nb = load_surface_neighborhood("fsaverage6", freesurfer_dir=tmp_path)
+    valid = nb[nb >= 0]
+    assert np.all(valid < n_lh + n_rh)
+
+
+def test_load_surface_neighborhood_no_cross_hemi(tmp_path):
+    """LH vertices should not have RH neighbors and vice versa."""
+    n_lh, n_rh = 20, 20
+    _make_sphere_surface(tmp_path, "fsaverage6", "lh", n_lh)
+    _make_sphere_surface(tmp_path, "fsaverage6", "rh", n_rh)
+
+    nb = load_surface_neighborhood("fsaverage6", freesurfer_dir=tmp_path)
+    # LH vertices (rows 0..n_lh-1): neighbors should all be < n_lh or -1
+    lh_nb = nb[:n_lh]
+    valid_lh = lh_nb[lh_nb >= 0]
+    assert np.all(valid_lh < n_lh)
+
+    # RH vertices (rows n_lh..): neighbors should all be >= n_lh or -1
+    rh_nb = nb[n_lh:]
+    valid_rh = rh_nb[rh_nb >= 0]
+    assert np.all(valid_rh >= n_lh)

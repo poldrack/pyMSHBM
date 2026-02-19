@@ -6,6 +6,7 @@ Usage:
 """
 
 import argparse
+import logging
 import sys
 
 import numpy as np
@@ -14,6 +15,11 @@ from pymshbm.pipeline.wrapper import run_wrapper
 
 
 def main(argv: list[str] | None = None) -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
+
     parser = argparse.ArgumentParser(
         description="Generate FC profiles and prepare training data.",
     )
@@ -32,6 +38,18 @@ def main(argv: list[str] | None = None) -> None:
                         help="Seed mesh identifier.")
     parser.add_argument("--targ-mesh", default="fsaverage6",
                         help="Target mesh identifier.")
+    parser.add_argument("--num-clusters", type=int, default=None,
+                        help="Number of parcellation clusters. Enables training + CIFTI output.")
+    parser.add_argument("--max-iter", type=int, default=50,
+                        help="Maximum EM iterations for group prior estimation.")
+    parser.add_argument("--mrf-weight", type=float, default=50.0,
+                        help="MRF smoothness weight for individual parcellation (default: 50).")
+    parser.add_argument("--spatial-weight", type=float, default=200.0,
+                        help="Spatial prior weight for individual parcellation (default: 200).")
+    parser.add_argument("--overwrite-fc", action="store_true", default=False,
+                        help="Overwrite existing FC profile files instead of reusing them.")
+    parser.add_argument("--overwrite-kmeans", action="store_true", default=False,
+                        help="Recompute initial k-means centroids instead of reusing cached.")
 
     args = parser.parse_args(argv)
 
@@ -60,6 +78,12 @@ def main(argv: list[str] | None = None) -> None:
             seed_mesh=args.seed_mesh,
             targ_mesh=args.targ_mesh,
             freesurfer_dir=args.freesurfer_dir,
+            num_clusters=args.num_clusters,
+            max_iter=args.max_iter,
+            mrf_weight=args.mrf_weight,
+            spatial_weight=args.spatial_weight,
+            overwrite_fc=args.overwrite_fc,
+            overwrite_kmeans=args.overwrite_kmeans,
         )
         print(f"Wrapper complete. Output: {result_dir}")
     except (FileNotFoundError, ValueError) as exc:

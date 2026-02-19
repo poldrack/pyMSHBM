@@ -3,6 +3,7 @@
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import nibabel as nib
 import nibabel.freesurfer as fs
@@ -148,3 +149,84 @@ def test_cli_auto_seed_labels_with_freesurfer_dir(tmp_path):
     # Verify output was created
     output_dirs = list(output_dir.iterdir())
     assert len(output_dirs) > 0
+
+
+# ---------------------------------------------------------------------------
+# test_cli_with_num_clusters
+# ---------------------------------------------------------------------------
+
+def _make_mock_params(n_vertices, num_clusters, num_subs):
+    """Build a mock MSHBMParams with valid s_lambda."""
+    from pymshbm.types import MSHBMParams
+    N = 2 * n_vertices
+    D = 10
+    L = num_clusters
+    S = num_subs
+    rng = np.random.default_rng(99)
+    s_lambda = rng.random((N, L, S))
+    s_lambda /= s_lambda.sum(axis=1, keepdims=True)
+    return MSHBMParams(
+        mu=rng.random((D, L)),
+        epsil=rng.random(L),
+        sigma=rng.random(L),
+        theta=rng.random((N, L)),
+        kappa=rng.random(L),
+        s_lambda=s_lambda,
+        s_psi=rng.random((D, L, S)),
+        s_t_nu=rng.random((D, L, 1, S)),
+        iter_inter=5,
+        record=[1.0, 2.0],
+    )
+
+
+def _mock_parcellation(data, group_priors, neighborhood, w=200.0, c=50.0,
+                       max_iter=50):
+    """Mock parcellation_single_subject returning random labels."""
+    n_vertices = data.shape[0] // 2
+    rng = np.random.default_rng(42)
+    lh = rng.integers(0, 4, size=n_vertices).astype(np.int32)
+    rh = rng.integers(0, 4, size=n_vertices).astype(np.int32)
+    return lh, rh
+
+
+def test_cli_with_num_clusters(tmp_path):
+    """CLI with --num-clusters should produce .dlabel.nii files."""
+    from pymshbm.cli.wrapper import main
+
+    n_vertices, n_timepoints, n_seeds = 20, 30, 5
+    num_clusters = 3
+    csv_file, lh_npy, rh_npy = _setup_wrapper_data(
+        tmp_path, n_vertices=n_vertices, n_timepoints=n_timepoints,
+        n_seeds=n_seeds, n_subs=2, n_sess=2,
+    )
+    output_dir = tmp_path / "output_clusters"
+
+    mock_params = _make_mock_params(n_vertices, num_clusters, 2)
+    mock_nb = np.full((2 * n_vertices, 3), -1, dtype=np.int64)
+
+    with patch("pymshbm.pipeline.wrapper.params_training",
+               return_value=mock_params), \
+         patch("pymshbm.pipeline.wrapper.parcellation_single_subject",
+               side_effect=_mock_parcellation), \
+         patch("pymshbm.pipeline.wrapper.load_surface_neighborhood",
+               return_value=mock_nb):
+        main([
+            str(csv_file), str(output_dir),
+            "--seed-labels-lh", str(lh_npy),
+            "--seed-labels-rh", str(rh_npy),
+            "--num-clusters", str(num_clusters),
+            "--mrf-weight", "50",
+            "--spatial-weight", "200",
+        ])
+
+    # Find the output Params_* directory
+    params_dirs = [d for d in output_dir.iterdir() if d.is_dir()]
+    assert len(params_dirs) == 1
+    result_dir = params_dirs[0]
+
+    # Check CIFTI parcellations
+    cifti_dir = result_dir / "cifti_parcellations"
+    assert cifti_dir.exists()
+    for sub_id in ("sub001", "sub002"):
+        dlabel = cifti_dir / f"{sub_id}.dlabel.nii"
+        assert dlabel.exists(), f"Missing {dlabel}"
