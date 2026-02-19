@@ -15,8 +15,12 @@ from pymshbm.pipeline.wrapper import run_wrapper
 
 
 def main(argv: list[str] | None = None) -> None:
+    parser_pre = argparse.ArgumentParser(add_help=False)
+    parser_pre.add_argument("--verbose", action="store_true", default=False)
+    pre_args, _ = parser_pre.parse_known_args(argv)
+
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG if pre_args.verbose else logging.INFO,
         format="%(levelname)s: %(message)s",
     )
 
@@ -50,6 +54,8 @@ def main(argv: list[str] | None = None) -> None:
                         help="Overwrite existing FC profile files instead of reusing them.")
     parser.add_argument("--overwrite-kmeans", action="store_true", default=False,
                         help="Recompute initial k-means centroids instead of reusing cached.")
+    parser.add_argument("--verbose", action="store_true", default=False,
+                        help="Enable detailed progress output for EM estimation.")
 
     args = parser.parse_args(argv)
 

@@ -4,10 +4,14 @@ Ports CBIG_MSHBM_estimate_group_priors.m with three nested EM loops:
     inter-subject -> intra-subject -> session-level vMF.
 """
 
+import logging
+
 import numpy as np
 
 from pymshbm.math.vmf import ad, cdln, inv_ad, vmf_log_probability
 from pymshbm.types import MSHBMParams
+
+logger = logging.getLogger(__name__)
 
 
 def estimate_group_priors(
@@ -26,6 +30,11 @@ def estimate_group_priors(
     Returns:
         MSHBMParams with estimated group priors.
     """
+    N, D, S, T = data.shape
+    logger.info("  EM estimation: N=%d vertices, D=%d features, "
+                "S=%d subjects, T=%d sessions, L=%d clusters",
+                N, D, S, T, settings["num_clusters"])
+
     params = initialize_params(data, g_mu, settings)
 
     cost_inter = 0.0
@@ -41,10 +50,16 @@ def estimate_group_priors(
         params.s_psi = np.tile(g_mu[:, :, np.newaxis], (1, 1, S))
 
         # Inner EM: session-level clustering + intra-subject
+        logger.debug("  Outer iter %d/%d: session-level vMF clustering",
+                     iteration, settings["max_iter"])
         params = vmf_clustering_subject_session(params, settings, data)
+        logger.debug("  Outer iter %d/%d: intra-subject variability",
+                     iteration, settings["max_iter"])
         params = intra_subject_var(params, settings)
 
         # Inter-subject variability
+        logger.debug("  Outer iter %d/%d: inter-subject variability",
+                     iteration, settings["max_iter"])
         params = inter_subject_var(params, settings)
 
         # Compute cost
@@ -52,8 +67,16 @@ def estimate_group_priors(
         record.append(float(update_cost))
 
         if iteration > 1 and abs(cost_inter) > 0:
-            if abs((update_cost - cost_inter) / cost_inter) <= settings["conv_th"]:
+            rel_change = abs((update_cost - cost_inter) / cost_inter)
+            logger.info("  Outer iter %d/%d: cost=%.4f  rel_change=%.2e",
+                        iteration, settings["max_iter"],
+                        update_cost, rel_change)
+            if rel_change <= settings["conv_th"]:
+                logger.info("  Converged at outer iteration %d", iteration)
                 break
+        else:
+            logger.info("  Outer iter %d/%d: cost=%.4f",
+                        iteration, settings["max_iter"], update_cost)
         cost_inter = update_cost
 
     params.record = record
@@ -143,11 +166,15 @@ def vmf_clustering_subject_session(
         with np.errstate(divide="ignore", invalid="ignore"):
             converged = np.where(np.abs(cost) > 0, np.abs((update_cost - cost) / cost) <= epsilon, False)
         if np.all(converged) and iter_em > 1:
+            logger.debug("    Inner EM converged at iteration %d", iter_em)
             break
         if iter_em > 100:
+            logger.debug("    Inner EM reached max iterations (100)")
             break
         cost = update_cost
 
+    logger.debug("    Inner EM: %d iterations, kappa=%.1f",
+                 iter_em, float(params.kappa[0]))
     return params
 
 
@@ -267,9 +294,9 @@ def intra_subject_var(
     dim = settings["dim"]
     epsilon = settings["epsilon"]
 
-    for _ in range(50):
+    for intra_iter in range(1, 51):
         # Update s_psi — vectorized over S
-        # s_t_nu: (D, L, T, S), sum over T → (D, L, S)
+        # s_t_nu: (D, L, T, S), sum over T -> (D, L, S)
         accum = (
             params.sigma[np.newaxis, :, np.newaxis] * params.s_t_nu.sum(axis=2)
             + params.epsil[np.newaxis, :, np.newaxis] * params.mu[:, :, np.newaxis]
@@ -300,6 +327,9 @@ def intra_subject_var(
             break
         params.sigma = sigma_new
 
+    logger.debug("    Intra-subject: %d iterations, "
+                 "sigma=[%s]", intra_iter,
+                 ", ".join(f"{s:.1f}" for s in params.sigma))
     return params
 
 
