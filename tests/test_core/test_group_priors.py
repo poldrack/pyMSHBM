@@ -136,3 +136,41 @@ def test_estimate_group_priors_converges(synthetic_data, synthetic_g_mu, small_s
     )
     # Should complete without error and record costs
     assert len(params.record) >= 1
+
+
+def test_estimate_group_priors_numerical_regression():
+    """Regression test: verify exact numerical output hasn't changed."""
+    rng = np.random.default_rng(42)
+    N, D, S, T, L = 20, 10, 2, 2, 3
+    data = rng.standard_normal((N, D, S, T))
+    for s in range(S):
+        for t in range(T):
+            norms = np.linalg.norm(data[:, :, s, t], axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            data[:, :, s, t] /= norms
+
+    g_mu = rng.standard_normal((D, L))
+    g_mu /= np.linalg.norm(g_mu, axis=0, keepdims=True)
+
+    settings = {
+        "num_sub": S, "num_session": T, "num_clusters": L,
+        "dim": D - 1, "ini_concentration": 500,
+        "epsilon": 1e-4, "conv_th": 1e-5, "max_iter": 5,
+    }
+    params = estimate_group_priors(data, g_mu, settings)
+
+    expected_mu = np.array([
+        [-0.32384962, -0.35860489,  0.09980772],
+        [ 0.14396749,  0.42800477,  0.28587461],
+        [-0.05239569, -0.41211974, -0.08265555],
+    ])
+    np.testing.assert_allclose(params.mu[:3, :], expected_mu, atol=1e-6)
+    np.testing.assert_allclose(
+        params.sigma, [7.27413067, 6.5695762, 9.71016853], atol=1e-4)
+    np.testing.assert_allclose(params.theta.sum(), 23.0, atol=0.01)
+    np.testing.assert_allclose(params.s_lambda.sum(), 40.0, atol=0.1)
+    assert params.iter_inter == 2
+    np.testing.assert_allclose(
+        params.record, [-19904.5266, -19904.527], atol=0.01)
+    np.testing.assert_allclose(
+        np.linalg.norm(params.mu, axis=0), [1.0, 1.0, 1.0], atol=1e-10)

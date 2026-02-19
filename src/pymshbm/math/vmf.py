@@ -85,6 +85,7 @@ def vmf_log_probability(
     X: np.ndarray,
     nu: np.ndarray,
     kappa: np.ndarray,
+    log_c: np.ndarray | None = None,
 ) -> np.ndarray:
     """Log probability under vMF distribution.
 
@@ -92,11 +93,14 @@ def vmf_log_probability(
         X: Data matrix (N x D), each row a unit vector.
         nu: Mean directions (D x L), each column a unit vector.
         kappa: Concentration parameters (L,).
+        log_c: Optional precomputed log normalizing constants (L,).
+            When provided, skips the expensive cdln computation.
 
     Returns:
         N x L matrix of log probabilities.
     """
-    d = X.shape[1] - 1
-    log_c = cdln(kappa, d)  # (L,)
+    if log_c is None:
+        d = X.shape[1] - 1
+        log_c = cdln(kappa, d)  # (L,)
     dot_product = X @ nu  # (N, L)
     return log_c[np.newaxis, :] + kappa[np.newaxis, :] * dot_product

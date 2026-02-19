@@ -134,11 +134,12 @@ def vmf_clustering_subject_session(
         # M-step: update kappa and s_t_nu
         _m_step(params, settings, data, epsilon, c0)
 
-        # E-step: update s_lambda and theta
-        _e_step(params, settings, data)
+        # E-step: update s_lambda and theta; cache log-likelihoods
+        log_vmf_cache = _e_step(params, settings, data)
 
-        # Check convergence
-        update_cost = _compute_em_cost(params, settings, data)
+        # Check convergence (reuse cached log-likelihoods)
+        update_cost = _compute_em_cost(params, settings, data,
+                                       log_vmf_cache=log_vmf_cache)
         with np.errstate(divide="ignore", invalid="ignore"):
             converged = np.where(np.abs(cost) > 0, np.abs((update_cost - cost) / cost) <= epsilon, False)
         if np.all(converged) and iter_em > 1:
@@ -162,18 +163,15 @@ def _m_step(
     L = settings["num_clusters"]
     dim = settings["dim"]
 
+    # s_t_nu is (D, L, T, S) but einsum needs matching index for S
+    # s_lambda is (N, L, S), data is (N, D, S, T)
     for _ in range(50):  # Max M-step iterations
-        # Update kappa
-        kappa_num = 0.0
-        kappa_den = 0.0
-        for s in range(S):
-            for t in range(T):
-                X = data[:, :, s, t]  # (N, D)
-                nu = params.s_t_nu[:, :, t, s]  # (D, L)
-                sl = params.s_lambda[:, :, s]  # (N, L)
-                dot = X @ nu  # (N, L)
-                kappa_num += np.nansum(sl * dot)
-            kappa_den += np.nansum(params.s_lambda[:, :, s])
+        # Update kappa — vectorized over S, T
+        # dot products: sum_n,d data[n,d,s,t] * s_t_nu[d,l,t,s] * s_lambda[n,l,s]
+        # First compute data @ s_t_nu per (s,t): einsum for dot product
+        dots = np.einsum("ndst,dlts->nlst", data, params.s_t_nu)  # (N, L, S, T)
+        kappa_num = np.nansum(params.s_lambda[:, :, :, np.newaxis] * dots)
+        kappa_den = np.nansum(params.s_lambda)
 
         if kappa_den > 0:
             rbar = kappa_num / kappa_den
@@ -183,25 +181,27 @@ def _m_step(
                 kappa_new = params.kappa[0]
             params.kappa = np.full(L, kappa_new)
 
-        # Update s_t_nu
-        all_converged = True
-        for s in range(S):
-            for t in range(T):
-                X = data[:, :, s, t]  # (N, D)
-                sl = params.s_lambda[:, :, s]  # (N, L)
-                lambda_X = params.kappa[np.newaxis, :] * (X.T @ sl) + \
-                    params.sigma[np.newaxis, :] * params.s_psi[:, :, s]
-                norms = np.linalg.norm(lambda_X, axis=0, keepdims=True)
-                norms[norms == 0] = 1.0
-                nu_new = lambda_X / norms
+        # Update s_t_nu — vectorized over S, T
+        # weighted_data[d,l,s,t] = sum_n data[n,d,s,t] * s_lambda[n,l,s]
+        weighted_data = np.einsum("ndst,nls->dlst", data, params.s_lambda)
+        # lambda_X[d,l,t,s] = kappa[l] * weighted_data[d,l,s,t] + sigma[l] * s_psi[d,l,s]
+        # Note: need to transpose (s,t) -> (t,s) to match s_t_nu layout (D,L,T,S)
+        lambda_X = (
+            params.kappa[np.newaxis, :, np.newaxis, np.newaxis]
+            * weighted_data.transpose(0, 1, 3, 2)  # (D, L, T, S)
+            + params.sigma[np.newaxis, :, np.newaxis, np.newaxis]
+            * params.s_psi[:, :, np.newaxis, :]  # (D, L, 1, S) broadcast to T
+        )
+        norms = np.linalg.norm(lambda_X, axis=0, keepdims=True)
+        norms[norms == 0] = 1.0
+        nu_new = lambda_X / norms
 
-                old_nu = params.s_t_nu[:, :, t, s]
-                check = np.sum(nu_new * old_nu, axis=0)
-                check = np.where(np.isnan(check), 1.0, check)
-                if np.any(1 - check >= epsilon):
-                    all_converged = False
+        # Convergence check: cosine similarity between old and new
+        cos_sim = np.sum(nu_new * params.s_t_nu, axis=0)  # (L, T, S)
+        cos_sim = np.where(np.isnan(cos_sim), 1.0, cos_sim)
+        all_converged = np.all(1 - cos_sim < epsilon)
 
-                params.s_t_nu[:, :, t, s] = nu_new
+        params.s_t_nu = nu_new
 
         if all_converged:
             break
@@ -211,19 +211,29 @@ def _e_step(
     params: MSHBMParams,
     settings: dict,
     data: np.ndarray,
-) -> None:
-    """E-step: update s_lambda and theta."""
+) -> list[np.ndarray]:
+    """E-step: update s_lambda and theta.
+
+    Returns:
+        List of per-subject (N, L) accumulated log-vmf arrays for cost reuse.
+    """
     N, D, S, T = data.shape
     L = settings["num_clusters"]
-    dim = settings["dim"]
 
+    # Precompute log normalizing constant (kappa is uniform across L)
+    dim = settings["dim"]
+    log_c = cdln(params.kappa, dim)
+
+    log_vmf_cache = []
     for s in range(S):
         log_vmf_total = np.zeros((N, L))
         for t in range(T):
             X = data[:, :, s, t]  # (N, D)
             nu = params.s_t_nu[:, :, t, s]  # (D, L)
-            log_vmf = vmf_log_probability(X, nu, params.kappa)
+            log_vmf = vmf_log_probability(X, nu, params.kappa, log_c=log_c)
             log_vmf_total += np.nan_to_num(log_vmf, nan=0.0)
+
+        log_vmf_cache.append(log_vmf_total)
 
         # Add log theta prior
         log_theta = np.log(np.maximum(params.theta, np.finfo(float).tiny))
@@ -243,6 +253,7 @@ def _e_step(
         params.s_lambda[:, :, s] = s_lambda
 
     params.theta = _compute_theta(params.s_lambda)
+    return log_vmf_cache
 
 
 def intra_subject_var(
@@ -257,44 +268,34 @@ def intra_subject_var(
     epsilon = settings["epsilon"]
 
     for _ in range(50):
-        # Update s_psi
-        s_psi_new = np.zeros_like(params.s_psi)
-        for s in range(S):
-            accum = np.zeros_like(params.s_psi[:, :, s])
-            for t in range(T):
-                accum += params.sigma[np.newaxis, :] * params.s_t_nu[:, :, t, s]
-            accum += params.epsil[np.newaxis, :] * params.mu
-            norms = np.linalg.norm(accum, axis=0, keepdims=True)
-            norms[norms == 0] = 1.0
-            s_psi_new[:, :, s] = accum / norms
+        # Update s_psi — vectorized over S
+        # s_t_nu: (D, L, T, S), sum over T → (D, L, S)
+        accum = (
+            params.sigma[np.newaxis, :, np.newaxis] * params.s_t_nu.sum(axis=2)
+            + params.epsil[np.newaxis, :, np.newaxis] * params.mu[:, :, np.newaxis]
+        )
+        norms = np.linalg.norm(accum, axis=0, keepdims=True)
+        norms[norms == 0] = 1.0
+        s_psi_new = accum / norms
 
-        # Check convergence
-        all_converged = True
-        for s in range(S):
-            check = np.sum(s_psi_new[:, :, s] * params.s_psi[:, :, s], axis=0)
-            if np.any(1 - check >= epsilon):
-                all_converged = False
+        # Convergence check — vectorized
+        cos_sim = np.sum(s_psi_new * params.s_psi, axis=0)  # (L, S)
+        all_converged = np.all(1 - cos_sim < epsilon)
         params.s_psi = s_psi_new
 
-        # Update sigma
+        # Update sigma — vectorized with einsum
+        # rbar[l] = mean over (s,t) of dot(s_psi[:,l,s], s_t_nu[:,l,t,s])
+        rbar_all = np.einsum("dls,dlts->l", params.s_psi, params.s_t_nu) / (S * T)
         sigma_new = np.zeros(L)
         for l_idx in range(L):
-            accum = 0.0
-            count = 0
-            for s in range(S):
-                for t in range(T):
-                    val = np.sum(params.s_psi[:, l_idx, s] * params.s_t_nu[:, l_idx, t, s])
-                    if not np.isnan(val):
-                        accum += val
-                        count += 1
-            if count > 0:
-                rbar = accum / count
-                rbar = min(max(rbar, 1e-10), 1 - 1e-10)
-                sigma_new[l_idx] = inv_ad(dim, rbar)
-            else:
-                sigma_new[l_idx] = params.sigma[l_idx]
+            rb = min(max(float(rbar_all[l_idx]), 1e-10), 1 - 1e-10)
+            sigma_new[l_idx] = inv_ad(dim, rb)
 
-        if all_converged and np.mean(np.abs(params.sigma - sigma_new) / np.maximum(params.sigma, 1e-10)) < epsilon:
+        sigma_converged = (
+            np.mean(np.abs(params.sigma - sigma_new)
+                    / np.maximum(params.sigma, 1e-10)) < epsilon
+        )
+        if all_converged and sigma_converged:
             params.sigma = sigma_new
             break
         params.sigma = sigma_new
@@ -318,14 +319,11 @@ def inter_subject_var(
     norms[norms == 0] = 1.0
     params.mu = mu_update / norms
 
-    # Update epsil
+    # Update epsil — vectorized with einsum
+    rbar_all = np.einsum("dls,dl->l", params.s_psi, params.mu) / S
     for l_idx in range(L):
-        rbar = 0.0
-        for s in range(S):
-            rbar += np.sum(params.s_psi[:, l_idx, s] * params.mu[:, l_idx])
-        rbar /= S
-        rbar = min(max(rbar, 1e-10), 1 - 1e-10)
-        epsil_new = inv_ad(dim, rbar)
+        rb = min(max(float(rbar_all[l_idx]), 1e-10), 1 - 1e-10)
+        epsil_new = inv_ad(dim, rb)
         epsil_new = max(epsil_new, c0)
         if np.isinf(epsil_new):
             epsil_new = params.epsil[l_idx]
@@ -344,13 +342,14 @@ def _compute_initial_s_lambda(
     """Compute initial s_lambda from vMF log likelihoods."""
     N, D, S, T = data.shape
     s_lambda = np.zeros((N, L, S))
+    log_c = cdln(kappa, dim)
 
     for s in range(S):
         log_vmf_total = np.zeros((N, L))
         for t in range(T):
             X = data[:, :, s, t]
             nu = s_t_nu[:, :, t, s]
-            lv = vmf_log_probability(X, nu, kappa)
+            lv = vmf_log_probability(X, nu, kappa, log_c=log_c)
             log_vmf_total += np.nan_to_num(lv, nan=0.0)
 
         log_vmf_total -= log_vmf_total.max(axis=1, keepdims=True)
@@ -380,17 +379,30 @@ def _compute_em_cost(
     params: MSHBMParams,
     settings: dict,
     data: np.ndarray,
+    log_vmf_cache: list[np.ndarray] | None = None,
 ) -> np.ndarray:
-    """Compute per-subject EM cost."""
+    """Compute per-subject EM cost.
+
+    Args:
+        log_vmf_cache: Optional precomputed per-subject (N, L) log-vmf arrays
+            from _e_step. When provided, skips redundant vmf_log_probability
+            recomputation.
+    """
     N, D, S, T = data.shape
     costs = np.zeros(S)
+    log_c = None
     for s in range(S):
-        log_vmf_total = np.zeros((N, settings["num_clusters"]))
-        for t in range(T):
-            X = data[:, :, s, t]
-            nu = params.s_t_nu[:, :, t, s]
-            lv = vmf_log_probability(X, nu, params.kappa)
-            log_vmf_total += np.nan_to_num(lv, nan=0.0)
+        if log_vmf_cache is not None:
+            log_vmf_total = log_vmf_cache[s]
+        else:
+            if log_c is None:
+                log_c = cdln(params.kappa, settings["dim"])
+            log_vmf_total = np.zeros((N, settings["num_clusters"]))
+            for t in range(T):
+                X = data[:, :, s, t]
+                nu = params.s_t_nu[:, :, t, s]
+                lv = vmf_log_probability(X, nu, params.kappa, log_c=log_c)
+                log_vmf_total += np.nan_to_num(lv, nan=0.0)
 
         sl = params.s_lambda[:, :, s]
         log_theta = np.log(np.maximum(params.theta, np.finfo(float).tiny))
