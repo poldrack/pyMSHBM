@@ -199,11 +199,8 @@ def _vmf_em(data, s_lambda, kappa, s_t_nu, s_psi, sigma, theta,
 
                 # MRF term
                 V_temp = np.zeros((N, L))
-                active = s_lambda[:, :, s].sum(axis=1) != 0
-                if np.any(active) and c > 0:
-                    lam_active = s_lambda[active, :, s]
-                    V_lam = v_lambda_product(neighborhood, v_same, v_diff, lam_active)
-                    V_temp[active] = V_lam
+                if c > 0:
+                    V_temp = v_lambda_product(neighborhood, v_same, v_diff, s_lambda[:, :, s])
 
                 log_theta = np.log(np.maximum(theta, np.finfo(float).tiny))
                 log_posterior = log_vmf_total + w * log_theta - 2 * c * V_temp
