@@ -231,6 +231,22 @@ def _load_profiles_tensor(
     return data
 
 
+def _detect_valid_vertices(data: np.ndarray) -> np.ndarray:
+    """Detect non-medial-wall vertices.
+
+    A vertex is valid if it has a nonzero profile in at least one
+    (subject, session) slice.
+
+    Args:
+        data: (N, D, S, T) row-normalized profiles (zeros = medial wall).
+
+    Returns:
+        Boolean mask of shape (N,), True for valid vertices.
+    """
+    # Sum of absolute values across (D, S, T) — zero only if all-zero
+    return np.any(data != 0, axis=(1, 2, 3))
+
+
 def _centroids_path(profiles_dir: Path, num_clusters: int) -> Path:
     """Return the path where cached k-means centroids are stored."""
     return profiles_dir / f"g_mu_K{num_clusters}.npy"
@@ -241,6 +257,7 @@ def _compute_initial_centroids(
     num_clusters: int,
     overwrite: bool = False,
     cache_dir: Path | None = None,
+    valid_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """Compute initial group centroids via k-means on averaged profiles.
 
@@ -253,6 +270,8 @@ def _compute_initial_centroids(
         overwrite: If True, recompute even when a cached file exists.
         cache_dir: Directory for centroid cache file. Defaults to
             avg_path's parent.
+        valid_mask: Optional boolean mask (N,) to exclude medial wall
+            vertices before k-means.
 
     Returns:
         (D, K) unit-normalized centroids.
@@ -265,6 +284,8 @@ def _compute_initial_centroids(
         return np.load(str(cached))
 
     avg = zarr.open_array(str(avg_path), mode="r")[:]  # (N, D)
+    if valid_mask is not None:
+        avg = avg[valid_mask]
     _, centroids = generate_ini_params(avg, num_clusters)
     np.save(str(cached), centroids)
     return centroids
@@ -445,28 +466,35 @@ def run_wrapper(
     if num_clusters is not None:
         subject_ids = [s[0] for s in subjects]
 
-        # Step 6: Load profiles tensor
+        # Step 6: Load profiles tensor + detect medial wall
         logger.info("Step 6/%d: Loading profiles into training tensor",
                     total_steps)
         tensor_cache = dirs["profiles"] / "normalized_tensor.zarr"
-        data = _load_profiles_tensor(
+        data_full = _load_profiles_tensor(
             store_path, len(subjects), sessions_per_sub,
             cache_path=tensor_cache, overwrite=overwrite_fc,
         )
+        valid_mask = _detect_valid_vertices(data_full)
+        n_valid = int(valid_mask.sum())
+        n_full = data_full.shape[0]
+        logger.info("  %d/%d vertices are non-medial-wall (%.0f%% reduction)",
+                    n_valid, n_full, (1 - n_valid / n_full) * 100)
+        data_reduced = data_full[valid_mask]
 
-        # Step 7: Compute initial centroids
+        # Step 7: Compute initial centroids (on reduced vertices)
         logger.info("Step 7/%d: Computing initial centroids via k-means",
                     total_steps)
         g_mu = _compute_initial_centroids(
             avg_path, num_clusters,
             overwrite=overwrite_kmeans,
             cache_dir=dirs["profiles"],
+            valid_mask=valid_mask,
         )
 
-        # Step 8: Run training (group prior estimation)
+        # Step 8: Run training (group prior estimation) on reduced data
         logger.info("Step 8/%d: Running group prior estimation", total_steps)
         params = params_training(
-            data=data,
+            data=data_reduced,
             g_mu=g_mu,
             num_clusters=num_clusters,
             max_iter=max_iter,
@@ -475,17 +503,28 @@ def run_wrapper(
             subject_ids=subject_ids,
         )
 
-        # Step 9: Individual parcellation with MRF
+        # Expand theta and s_lambda back to full surface for step 9
+        L = num_clusters
+        theta_full = np.zeros((n_full, L), dtype=np.float64)
+        theta_full[valid_mask] = params.theta
+        params.theta = theta_full
+        if params.s_lambda is not None:
+            S = len(subject_ids)
+            s_lambda_full = np.zeros((n_full, L, S), dtype=np.float64)
+            s_lambda_full[valid_mask] = params.s_lambda
+            params.s_lambda = s_lambda_full
+
+        # Step 9: Individual parcellation with MRF (full surface)
         logger.info("Step 9/%d: Running MRF-regularized individual parcellation "
                     "(c=%.1f, w=%.1f)", total_steps, mrf_weight, spatial_weight)
         neighborhood = load_surface_neighborhood(
             targ_mesh, freesurfer_dir,
         )
         results = []
-        n_targ = data.shape[0] // 2
+        n_targ = data_full.shape[0] // 2
         for s, sid in enumerate(subject_ids):
             n_sess = sessions_per_sub[s]
-            sub_data = data[:, :, s:s + 1, :n_sess]
+            sub_data = data_full[:, :, s:s + 1, :n_sess]
             logger.info("  %s (%d sessions)", sid, n_sess)
             lh_labels, rh_labels = parcellation_single_subject(
                 data=sub_data,

@@ -11,6 +11,7 @@ import zarr
 
 from pymshbm.pipeline.wrapper import (
     _compute_initial_centroids,
+    _detect_valid_vertices,
     _load_profiles_tensor,
     average_profiles,
     compute_profile,
@@ -677,6 +678,53 @@ def test_load_profiles_tensor_unequal_sessions(tmp_path):
     np.testing.assert_array_equal(tensor[:, :, 1, 1], 0.0)
     # Sub2 session 1 should NOT be all zeros
     assert np.any(tensor[:, :, 1, 0] != 0)
+
+
+# ---------------------------------------------------------------------------
+# test__detect_valid_vertices
+# ---------------------------------------------------------------------------
+
+def test_detect_valid_vertices_all_valid():
+    """All-nonzero tensor should give all-True mask."""
+    rng = np.random.default_rng(42)
+    data = rng.standard_normal((20, 6, 2, 2)).astype(np.float32)
+    norms = np.linalg.norm(data, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    data /= norms
+    mask = _detect_valid_vertices(data)
+    assert mask.shape == (20,)
+    assert mask.all()
+
+
+def test_detect_valid_vertices_excludes_zero_rows():
+    """Vertices that are all-zero across every (s,t) should be False."""
+    rng = np.random.default_rng(42)
+    data = rng.standard_normal((20, 6, 2, 2)).astype(np.float32)
+    norms = np.linalg.norm(data, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    data /= norms
+    # Zero out vertices 3, 7, 15 in ALL subject/session slices
+    data[3, :, :, :] = 0.0
+    data[7, :, :, :] = 0.0
+    data[15, :, :, :] = 0.0
+    mask = _detect_valid_vertices(data)
+    assert not mask[3]
+    assert not mask[7]
+    assert not mask[15]
+    assert mask.sum() == 17
+
+
+def test_detect_valid_vertices_partial_zero_kept():
+    """Vertex zero in one (s,t) but nonzero in another should stay True."""
+    rng = np.random.default_rng(42)
+    data = rng.standard_normal((20, 6, 2, 2)).astype(np.float32)
+    norms = np.linalg.norm(data, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    data /= norms
+    # Zero out vertex 5 in only one (s,t) slice
+    data[5, :, 0, 0] = 0.0
+    mask = _detect_valid_vertices(data)
+    assert mask[5]  # Should still be valid
 
 
 # ---------------------------------------------------------------------------
