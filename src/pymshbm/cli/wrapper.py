@@ -54,6 +54,8 @@ def main(argv: list[str] | None = None) -> None:
                         help="Overwrite existing FC profile files instead of reusing them.")
     parser.add_argument("--overwrite-kmeans", action="store_true", default=False,
                         help="Recompute initial k-means centroids instead of reusing cached.")
+    parser.add_argument("--overwrite-em", action="store_true", default=False,
+                        help="Recompute group priors instead of reusing cached Params_Final.mat.")
     parser.add_argument("--verbose", action="store_true", default=False,
                         help="Enable detailed progress output for EM estimation.")
 
@@ -90,6 +92,7 @@ def main(argv: list[str] | None = None) -> None:
             spatial_weight=args.spatial_weight,
             overwrite_fc=args.overwrite_fc,
             overwrite_kmeans=args.overwrite_kmeans,
+            overwrite_em=args.overwrite_em,
         )
         print(f"Wrapper complete. Output: {result_dir}")
     except (FileNotFoundError, ValueError) as exc:

@@ -1213,6 +1213,130 @@ def test_run_wrapper_overwrite_kmeans_recomputes(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# test_run_wrapper EM caching (--overwrite-em)
+# ---------------------------------------------------------------------------
+
+def _make_params_training_side_effect(mock_params):
+    """Create a side_effect for params_training that saves Params_Final.mat."""
+    from pymshbm.pipeline.training import _save_params
+
+    def _side_effect(*args, **kwargs):
+        output_dir = kwargs.get("output_dir")
+        if output_dir is not None:
+            _save_params(mock_params, Path(output_dir))
+        return mock_params
+
+    return _side_effect
+
+
+def test_run_wrapper_reuses_cached_em_params(tmp_path):
+    """Step 8 should reuse Params_Final.mat when it already exists."""
+    rng = np.random.default_rng(42)
+    num_clusters = 3
+    csv_file, seed_labels, mock_params, mock_nb = _setup_num_clusters_run(
+        tmp_path, rng, num_clusters=num_clusters,
+    )
+
+    side_effect = _make_params_training_side_effect(mock_params)
+
+    # First run — params_training is called and Params_Final.mat is created
+    with patch("pymshbm.pipeline.wrapper.params_training",
+               side_effect=side_effect) as mock_pt, \
+         patch("pymshbm.pipeline.wrapper.parcellation_single_subject",
+               side_effect=_mock_parcellation), \
+         patch("pymshbm.pipeline.wrapper.load_surface_neighborhood",
+               return_value=mock_nb):
+        result_dir = run_wrapper(
+            sub_list=csv_file,
+            output_dir=tmp_path / "output",
+            seed_labels_lh=seed_labels,
+            seed_labels_rh=seed_labels,
+            seed_mesh="fsaverage3",
+            targ_mesh="fsaverage6",
+            num_clusters=num_clusters,
+        )
+        assert mock_pt.call_count == 1
+
+    params_path = result_dir / "priors" / "Params_Final.mat"
+    assert params_path.exists()
+    original_mtime = params_path.stat().st_mtime
+
+    # Second run — params_training should NOT be called
+    with patch("pymshbm.pipeline.wrapper.params_training",
+               side_effect=side_effect) as mock_pt2, \
+         patch("pymshbm.pipeline.wrapper.parcellation_single_subject",
+               side_effect=_mock_parcellation), \
+         patch("pymshbm.pipeline.wrapper.load_surface_neighborhood",
+               return_value=mock_nb):
+        run_wrapper(
+            sub_list=csv_file,
+            output_dir=tmp_path / "output",
+            seed_labels_lh=seed_labels,
+            seed_labels_rh=seed_labels,
+            seed_mesh="fsaverage3",
+            targ_mesh="fsaverage6",
+            num_clusters=num_clusters,
+        )
+        assert mock_pt2.call_count == 0
+
+    assert params_path.stat().st_mtime == original_mtime
+
+
+def test_run_wrapper_overwrite_em_recomputes(tmp_path):
+    """With overwrite_em=True, params_training should be called again."""
+    import time
+    rng = np.random.default_rng(42)
+    num_clusters = 3
+    csv_file, seed_labels, mock_params, mock_nb = _setup_num_clusters_run(
+        tmp_path, rng, num_clusters=num_clusters,
+    )
+
+    side_effect = _make_params_training_side_effect(mock_params)
+
+    # First run
+    with patch("pymshbm.pipeline.wrapper.params_training",
+               side_effect=side_effect), \
+         patch("pymshbm.pipeline.wrapper.parcellation_single_subject",
+               side_effect=_mock_parcellation), \
+         patch("pymshbm.pipeline.wrapper.load_surface_neighborhood",
+               return_value=mock_nb):
+        result_dir = run_wrapper(
+            sub_list=csv_file,
+            output_dir=tmp_path / "output",
+            seed_labels_lh=seed_labels,
+            seed_labels_rh=seed_labels,
+            seed_mesh="fsaverage3",
+            targ_mesh="fsaverage6",
+            num_clusters=num_clusters,
+        )
+
+    params_path = result_dir / "priors" / "Params_Final.mat"
+    original_mtime = params_path.stat().st_mtime
+    time.sleep(0.05)
+
+    # Second run with overwrite_em=True — params_training should be called
+    with patch("pymshbm.pipeline.wrapper.params_training",
+               side_effect=side_effect) as mock_pt, \
+         patch("pymshbm.pipeline.wrapper.parcellation_single_subject",
+               side_effect=_mock_parcellation), \
+         patch("pymshbm.pipeline.wrapper.load_surface_neighborhood",
+               return_value=mock_nb):
+        run_wrapper(
+            sub_list=csv_file,
+            output_dir=tmp_path / "output",
+            seed_labels_lh=seed_labels,
+            seed_labels_rh=seed_labels,
+            seed_mesh="fsaverage3",
+            targ_mesh="fsaverage6",
+            num_clusters=num_clusters,
+            overwrite_em=True,
+        )
+        assert mock_pt.call_count == 1
+
+    assert params_path.stat().st_mtime > original_mtime
+
+
+# ---------------------------------------------------------------------------
 # test__load_profiles_tensor with cortex_mask
 # ---------------------------------------------------------------------------
 

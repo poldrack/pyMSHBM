@@ -56,4 +56,4 @@ Traceback (most recent call last):
 IndexError: index 80951 is out of bounds for axis 0 with size 74947
 ```
 
-[ ] Step 8 should save its results so that they can be reused (unless --overwrite-em is specified)
+[x] Step 8 should save its results so that they can be reused (unless --overwrite-em is specified)

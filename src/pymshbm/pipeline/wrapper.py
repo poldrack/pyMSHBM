@@ -18,6 +18,7 @@ from pymshbm.io.freesurfer import (
     load_cortex_mask,
     load_surface_neighborhood,
 )
+from pymshbm.io.mat_interop import load_params_final
 from pymshbm.io.profile_lists import write_profile_list
 from pymshbm.io.readers import read_fmri
 from pymshbm.pipeline.single_subject import parcellation_single_subject
@@ -388,6 +389,7 @@ def run_wrapper(
     spatial_weight: float = 200.0,
     overwrite_fc: bool = False,
     overwrite_kmeans: bool = False,
+    overwrite_em: bool = False,
 ) -> Path:
     """Run the full MSHBM wrapper pipeline.
 
@@ -553,16 +555,23 @@ def run_wrapper(
         )
 
         # Step 8: Run training (group prior estimation) on reduced data
-        logger.info("Step 8/%d: Running group prior estimation", total_steps)
-        params = params_training(
-            data=data_reduced,
-            g_mu=g_mu,
-            num_clusters=num_clusters,
-            max_iter=max_iter,
-            save_all=True,
-            output_dir=main_dir,
-            subject_ids=subject_ids,
-        )
+        params_path = main_dir / "priors" / "Params_Final.mat"
+        if not overwrite_em and params_path.exists():
+            logger.info("Step 8/%d: Reusing cached group priors from %s",
+                        total_steps, params_path)
+            params = load_params_final(params_path)
+        else:
+            logger.info("Step 8/%d: Running group prior estimation",
+                        total_steps)
+            params = params_training(
+                data=data_reduced,
+                g_mu=g_mu,
+                num_clusters=num_clusters,
+                max_iter=max_iter,
+                save_all=True,
+                output_dir=main_dir,
+                subject_ids=subject_ids,
+            )
 
         # Expand theta and s_lambda back to full surface for step 9
         L = num_clusters
