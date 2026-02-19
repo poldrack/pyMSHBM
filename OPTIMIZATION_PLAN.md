@@ -229,3 +229,49 @@ With N=81924, this wastes ~30% of all computation.
 ```bash
 uv run python -m pytest tests/ -v  # 165 passed
 ```
+
+---
+
+## Round 4: Memory mapping and multiprocessing
+
+### 15. Memory-map the data tensor [DONE]
+
+**Problem:** `_load_profiles_tensor` loads the full 25.2 GB tensor into memory
+via `zarr.open_array(...)[:]`. On machines with limited RAM this causes heavy
+swapping, and the full tensor must be resident even though the EM loops only
+access one (subject, session) slice at a time.
+
+**Fix:** Cache the normalized tensor as `.npy` instead of Zarr. Return
+`np.load(path, mmap_mode='r')` so the OS pages in data on demand. Also cache
+the medial-wall-filtered reduced tensor as a separate `.npy` memmap.
+
+- [x] Change `_load_profiles_tensor` cache from Zarr to `.npy`
+- [x] Return `np.memmap` via `np.load(..., mmap_mode='r')`
+- [x] Cache reduced tensor as `.npy` memmap in `run_wrapper`
+- [x] Update existing tests for new cache format
+
+### 16. Multiprocessing over subjects [DONE]
+
+**Problem:** The S×T matmul loops in `_e_step`, `_compute_weighted_data`,
+`_m_step` (kappa accumulation), `_compute_em_cost`, and
+`_compute_initial_s_lambda` are embarrassingly parallel across subjects.
+With S=5 subjects on a multi-core machine, only one core is utilized.
+
+**Fix:** Use `concurrent.futures.ProcessPoolExecutor` with a persistent pool.
+Workers open their own memory-mapped view of the data tensor via
+`_init_worker(data_path)`. Each subject is processed by a separate worker.
+Falls back to sequential processing when data is not memory-mapped (e.g.
+small test arrays).
+
+- [x] Add module-level worker state and `_init_worker` initializer
+- [x] Add per-subject worker functions for each parallelizable operation
+- [x] `_create_pool` auto-detects memmap and creates pool
+- [x] Pool created once in `estimate_group_priors`, passed through to inner functions
+- [x] Graceful fallback: non-memmap data uses sequential path (tests unaffected)
+- [x] Add test verifying parallel path matches sequential results
+
+## Round 4 Verification
+
+```bash
+uv run python -m pytest tests/ -v
+```

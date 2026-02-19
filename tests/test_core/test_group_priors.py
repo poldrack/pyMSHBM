@@ -168,6 +168,42 @@ def test_estimate_group_priors_float32_close_to_float64():
     assert params_f32.iter_inter == params_f64.iter_inter
 
 
+def test_estimate_group_priors_memmap_matches_regular(tmp_path):
+    """Memory-mapped data (parallel path) should match in-memory (sequential)."""
+    rng = np.random.default_rng(42)
+    N, D, S, T, L = 20, 10, 2, 2, 3
+    data = rng.standard_normal((N, D, S, T))
+    for s in range(S):
+        for t in range(T):
+            norms = np.linalg.norm(data[:, :, s, t], axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            data[:, :, s, t] /= norms
+
+    g_mu = rng.standard_normal((D, L))
+    g_mu /= np.linalg.norm(g_mu, axis=0, keepdims=True)
+
+    settings = {
+        "num_sub": S, "num_session": T, "num_clusters": L,
+        "dim": D - 1, "ini_concentration": 500,
+        "epsilon": 1e-4, "conv_th": 1e-5, "max_iter": 5,
+    }
+
+    # Sequential path (regular array)
+    params_seq = estimate_group_priors(data, g_mu, settings)
+
+    # Parallel path (memmap array)
+    data_path = tmp_path / "data.npy"
+    np.save(str(data_path), data)
+    data_mmap = np.load(str(data_path), mmap_mode='r')
+    params_par = estimate_group_priors(data_mmap, g_mu, settings)
+
+    np.testing.assert_allclose(params_par.mu, params_seq.mu, atol=1e-10)
+    np.testing.assert_allclose(params_par.sigma, params_seq.sigma, atol=1e-10)
+    np.testing.assert_allclose(params_par.theta, params_seq.theta, atol=1e-10)
+    np.testing.assert_allclose(params_par.record, params_seq.record, atol=1e-10)
+    assert params_par.iter_inter == params_seq.iter_inter
+
+
 def test_estimate_group_priors_numerical_regression():
     """Regression test: verify exact numerical output hasn't changed."""
     rng = np.random.default_rng(42)
