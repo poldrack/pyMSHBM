@@ -100,6 +100,13 @@ def _profiles_exist(
     return lh.exists() and rh.exists()
 
 
+def _avg_profiles_exist(avg_dir: Path, targ_mesh: str, seed_mesh: str) -> bool:
+    """Check whether both lh and rh averaged profile NIfTIs exist."""
+    lh = avg_dir / f"lh_{targ_mesh}_roi{seed_mesh}_avg_profile.nii.gz"
+    rh = avg_dir / f"rh_{targ_mesh}_roi{seed_mesh}_avg_profile.nii.gz"
+    return lh.exists() and rh.exists()
+
+
 def generate_and_save_profile(
     lh_fmri_path: Path,
     rh_fmri_path: Path,
@@ -462,13 +469,17 @@ def run_wrapper(
                     dirs_exist_ok=True)
 
     # Step 5: Average profiles
-    logger.info("Step 5/%d: Averaging profiles across subjects/sessions",
-                total_steps)
     avg_dir = dirs["profiles"] / "avg_profile"
-    average_profiles_nifti(
-        dirs["profiles"], len(subjects), sessions_per_sub,
-        avg_dir, seed_mesh, targ_mesh,
-    )
+    if not overwrite_fc and _avg_profiles_exist(avg_dir, targ_mesh, seed_mesh):
+        logger.info("Step 5/%d: Reusing existing averaged profiles",
+                    total_steps)
+    else:
+        logger.info("Step 5/%d: Averaging profiles across subjects/sessions",
+                    total_steps)
+        average_profiles_nifti(
+            dirs["profiles"], len(subjects), sessions_per_sub,
+            avg_dir, seed_mesh, targ_mesh,
+        )
 
     if num_clusters is not None:
         subject_ids = [s[0] for s in subjects]

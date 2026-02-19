@@ -46,7 +46,7 @@ def avg_profiles(profiles: list[np.ndarray]) -> np.ndarray:
 def generate_ini_params(
     avg_profile: np.ndarray,
     num_clusters: int,
-    num_init: int = 1000,
+    num_init: int = 10,
     out_dir: str | Path | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Generate initialization parameters via vMF clustering on averaged profiles.

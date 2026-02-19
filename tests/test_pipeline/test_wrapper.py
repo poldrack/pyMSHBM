@@ -561,6 +561,62 @@ def test_run_wrapper_overwrite_fc_regenerates_profiles(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# test_run_wrapper average profile caching
+# ---------------------------------------------------------------------------
+
+def test_run_wrapper_skips_existing_avg_profiles(tmp_path):
+    """Step 5 should skip averaging when avg profile files already exist."""
+    import time
+    rng = np.random.default_rng(42)
+    csv_file, output_dir, seed_labels, n_vertices = \
+        _setup_wrapper_with_precomputed_profiles(tmp_path, rng)
+
+    result_dir = list(output_dir.iterdir())[0]
+    avg_dir = (result_dir / "Params_training" /
+               "generate_profiles_and_ini_params" / "profiles" / "avg_profile")
+    avg_lh = avg_dir / "lh_fsaverage6_roifsaverage3_avg_profile.nii.gz"
+    assert avg_lh.exists()
+    original_mtime = avg_lh.stat().st_mtime
+
+    time.sleep(0.05)
+    run_wrapper(
+        sub_list=csv_file,
+        output_dir=output_dir,
+        seed_labels_lh=seed_labels,
+        seed_labels_rh=seed_labels,
+        seed_mesh="fsaverage3",
+        targ_mesh="fsaverage6",
+    )
+    assert avg_lh.stat().st_mtime == original_mtime
+
+
+def test_run_wrapper_overwrite_fc_regenerates_avg_profiles(tmp_path):
+    """With overwrite_fc=True, avg profiles should be recomputed."""
+    import time
+    rng = np.random.default_rng(42)
+    csv_file, output_dir, seed_labels, n_vertices = \
+        _setup_wrapper_with_precomputed_profiles(tmp_path, rng)
+
+    result_dir = list(output_dir.iterdir())[0]
+    avg_dir = (result_dir / "Params_training" /
+               "generate_profiles_and_ini_params" / "profiles" / "avg_profile")
+    avg_lh = avg_dir / "lh_fsaverage6_roifsaverage3_avg_profile.nii.gz"
+    original_mtime = avg_lh.stat().st_mtime
+
+    time.sleep(0.05)
+    run_wrapper(
+        sub_list=csv_file,
+        output_dir=output_dir,
+        seed_labels_lh=seed_labels,
+        seed_labels_rh=seed_labels,
+        seed_mesh="fsaverage3",
+        targ_mesh="fsaverage6",
+        overwrite_fc=True,
+    )
+    assert avg_lh.stat().st_mtime > original_mtime
+
+
+# ---------------------------------------------------------------------------
 # Helpers for _load_profiles_tensor / _compute_initial_centroids tests
 # ---------------------------------------------------------------------------
 

@@ -13,6 +13,7 @@ dependencies = [
     "nibabel",
     "h5py",
     "pytest>=9.0.2",
+    "scikit-learn>=1.8.0",
 ]
 
 [project.optional-dependencies]
