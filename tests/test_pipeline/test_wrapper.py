@@ -925,6 +925,164 @@ def test_run_wrapper_reuses_existing_centroids(tmp_path):
     assert centroids_path.stat().st_mtime == original_mtime
 
 
+def test_load_profiles_tensor_caches_to_zarr(tmp_path):
+    """First call should create a cached Zarr array at cache_path."""
+    rng = np.random.default_rng(42)
+    n_targ, n_seed = 10, 6
+    sessions_per_sub = [2, 1]
+    num_subs = 2
+    store_path = tmp_path / "fc_profiles.zarr"
+    cache_path = tmp_path / "normalized_tensor.zarr"
+
+    _create_profile_zarr(store_path, num_subs, sessions_per_sub,
+                         n_targ, n_seed, rng)
+
+    tensor = _load_profiles_tensor(
+        store_path, num_subs, sessions_per_sub, cache_path=cache_path,
+    )
+    assert cache_path.exists()
+    # Cached data should match returned tensor
+    cached = zarr.open_array(str(cache_path), mode="r")[:]
+    np.testing.assert_array_equal(cached, tensor)
+
+
+def test_load_profiles_tensor_reuses_cache(tmp_path):
+    """Second call should load from cache without touching the Zarr store."""
+    import time
+    rng = np.random.default_rng(42)
+    n_targ, n_seed = 10, 6
+    sessions_per_sub = [1]
+    store_path = tmp_path / "fc_profiles.zarr"
+    cache_path = tmp_path / "normalized_tensor.zarr"
+
+    _create_profile_zarr(store_path, 1, sessions_per_sub,
+                         n_targ, n_seed, rng)
+
+    # First call — populates cache
+    tensor1 = _load_profiles_tensor(
+        store_path, 1, sessions_per_sub, cache_path=cache_path,
+    )
+    original_mtime = cache_path.stat().st_mtime
+    time.sleep(0.05)
+
+    # Second call — should reuse cache (mtime unchanged)
+    tensor2 = _load_profiles_tensor(
+        store_path, 1, sessions_per_sub, cache_path=cache_path,
+    )
+    assert cache_path.stat().st_mtime == original_mtime
+    np.testing.assert_array_equal(tensor1, tensor2)
+
+
+def test_load_profiles_tensor_overwrite_regenerates_cache(tmp_path):
+    """With overwrite=True, cached tensor should be regenerated."""
+    import time
+    rng = np.random.default_rng(42)
+    n_targ, n_seed = 10, 6
+    sessions_per_sub = [1]
+    store_path = tmp_path / "fc_profiles.zarr"
+    cache_path = tmp_path / "normalized_tensor.zarr"
+
+    _create_profile_zarr(store_path, 1, sessions_per_sub,
+                         n_targ, n_seed, rng)
+
+    # First call
+    _load_profiles_tensor(
+        store_path, 1, sessions_per_sub, cache_path=cache_path,
+    )
+    original_mtime = cache_path.stat().st_mtime
+    time.sleep(0.05)
+
+    # Second call with overwrite
+    _load_profiles_tensor(
+        store_path, 1, sessions_per_sub,
+        cache_path=cache_path, overwrite=True,
+    )
+    assert cache_path.stat().st_mtime > original_mtime
+
+
+def test_run_wrapper_caches_normalized_tensor(tmp_path):
+    """Step 6 should create a cached normalized tensor Zarr."""
+    rng = np.random.default_rng(42)
+    num_clusters = 3
+    csv_file, seed_labels, mock_params, mock_nb = _setup_num_clusters_run(
+        tmp_path, rng, num_clusters=num_clusters,
+    )
+
+    with patch("pymshbm.pipeline.wrapper.params_training",
+               return_value=mock_params), \
+         patch("pymshbm.pipeline.wrapper.parcellation_single_subject",
+               side_effect=_mock_parcellation), \
+         patch("pymshbm.pipeline.wrapper.load_surface_neighborhood",
+               return_value=mock_nb):
+        result_dir = run_wrapper(
+            sub_list=csv_file,
+            output_dir=tmp_path / "output",
+            seed_labels_lh=seed_labels,
+            seed_labels_rh=seed_labels,
+            seed_mesh="fsaverage3",
+            targ_mesh="fsaverage6",
+            num_clusters=num_clusters,
+        )
+
+    profiles_dir = (result_dir / "Params_training" /
+                    "generate_profiles_and_ini_params" / "profiles")
+    cache_path = profiles_dir / "normalized_tensor.zarr"
+    assert cache_path.exists()
+
+
+def test_run_wrapper_overwrite_fc_invalidates_tensor_cache(tmp_path):
+    """With overwrite_fc=True, the normalized tensor cache should be regenerated."""
+    import time
+    rng = np.random.default_rng(42)
+    num_clusters = 3
+    csv_file, seed_labels, mock_params, mock_nb = _setup_num_clusters_run(
+        tmp_path, rng, num_clusters=num_clusters,
+    )
+
+    # First run
+    with patch("pymshbm.pipeline.wrapper.params_training",
+               return_value=mock_params), \
+         patch("pymshbm.pipeline.wrapper.parcellation_single_subject",
+               side_effect=_mock_parcellation), \
+         patch("pymshbm.pipeline.wrapper.load_surface_neighborhood",
+               return_value=mock_nb):
+        result_dir = run_wrapper(
+            sub_list=csv_file,
+            output_dir=tmp_path / "output",
+            seed_labels_lh=seed_labels,
+            seed_labels_rh=seed_labels,
+            seed_mesh="fsaverage3",
+            targ_mesh="fsaverage6",
+            num_clusters=num_clusters,
+        )
+
+    profiles_dir = (result_dir / "Params_training" /
+                    "generate_profiles_and_ini_params" / "profiles")
+    cache_path = profiles_dir / "normalized_tensor.zarr"
+    original_mtime = cache_path.stat().st_mtime
+    time.sleep(0.05)
+
+    # Second run with overwrite_fc
+    with patch("pymshbm.pipeline.wrapper.params_training",
+               return_value=mock_params), \
+         patch("pymshbm.pipeline.wrapper.parcellation_single_subject",
+               side_effect=_mock_parcellation), \
+         patch("pymshbm.pipeline.wrapper.load_surface_neighborhood",
+               return_value=mock_nb):
+        run_wrapper(
+            sub_list=csv_file,
+            output_dir=tmp_path / "output",
+            seed_labels_lh=seed_labels,
+            seed_labels_rh=seed_labels,
+            seed_mesh="fsaverage3",
+            targ_mesh="fsaverage6",
+            num_clusters=num_clusters,
+            overwrite_fc=True,
+        )
+
+    assert cache_path.stat().st_mtime > original_mtime
+
+
 def test_run_wrapper_overwrite_kmeans_recomputes(tmp_path):
     """With overwrite_kmeans=True, centroids should be recomputed."""
     import time

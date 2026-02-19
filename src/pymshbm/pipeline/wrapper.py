@@ -202,19 +202,31 @@ def _load_profiles_tensor(
     store_path: Path,
     num_subs: int,
     sessions_per_sub: list[int],
+    cache_path: Path | None = None,
+    overwrite: bool = False,
 ) -> np.ndarray:
-    """Load profiles from Zarr and row-normalize.
+    """Load profiles from Zarr, row-normalize, and optionally cache.
 
     Returns:
         (N, D, S, max_T) float64, row-normalized. NaN → 0 for
         unwritten sessions.
     """
-    data = zarr.open_array(str(store_path), mode="r")[:]
-    data = np.nan_to_num(data, nan=0.0)
+    if cache_path is not None and cache_path.exists() and not overwrite:
+        logger.info("  Reusing cached normalized tensor from %s", cache_path)
+        return zarr.open_array(str(cache_path), mode="r")[:]
 
-    for s in range(num_subs):
-        for t in range(sessions_per_sub[s]):
-            data[:, :, s, t] = _row_normalize(data[:, :, s, t])
+    data = zarr.open_array(str(store_path), mode="r")[:]
+    np.nan_to_num(data, nan=0.0, copy=False)
+
+    # Vectorized row normalization across all (sub, session) slices
+    norms = np.linalg.norm(data, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    data /= norms
+
+    if cache_path is not None:
+        if cache_path.exists():
+            shutil.rmtree(cache_path)
+        zarr.save(str(cache_path), data)
 
     return data
 
@@ -436,8 +448,10 @@ def run_wrapper(
         # Step 6: Load profiles tensor
         logger.info("Step 6/%d: Loading profiles into training tensor",
                     total_steps)
+        tensor_cache = dirs["profiles"] / "normalized_tensor.zarr"
         data = _load_profiles_tensor(
             store_path, len(subjects), sessions_per_sub,
+            cache_path=tensor_cache, overwrite=overwrite_fc,
         )
 
         # Step 7: Compute initial centroids
