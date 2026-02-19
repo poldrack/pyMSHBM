@@ -973,14 +973,40 @@ def test_run_wrapper_reuses_existing_centroids(tmp_path):
     assert centroids_path.stat().st_mtime == original_mtime
 
 
-def test_load_profiles_tensor_caches_to_zarr(tmp_path):
-    """First call should create a cached Zarr array at cache_path."""
+def test_load_profiles_tensor_returns_memmap(tmp_path):
+    """When cache_path is provided, return value should be a memory-mapped array."""
+    rng = np.random.default_rng(42)
+    n_targ, n_seed = 10, 6
+    sessions_per_sub = [1]
+    store_path = tmp_path / "fc_profiles.zarr"
+    cache_path = tmp_path / "normalized_tensor.npy"
+
+    _create_profile_zarr(store_path, 1, sessions_per_sub,
+                         n_targ, n_seed, rng)
+
+    # First call creates cache and returns memmap
+    tensor1 = _load_profiles_tensor(
+        store_path, 1, sessions_per_sub, cache_path=cache_path,
+    )
+    assert isinstance(tensor1, np.memmap)
+
+    # Second call loads from cache as memmap
+    tensor2 = _load_profiles_tensor(
+        store_path, 1, sessions_per_sub, cache_path=cache_path,
+    )
+    assert isinstance(tensor2, np.memmap)
+    np.testing.assert_array_equal(
+        np.asarray(tensor1), np.asarray(tensor2))
+
+
+def test_load_profiles_tensor_caches_to_npy(tmp_path):
+    """First call should create a cached .npy file at cache_path."""
     rng = np.random.default_rng(42)
     n_targ, n_seed = 10, 6
     sessions_per_sub = [2, 1]
     num_subs = 2
     store_path = tmp_path / "fc_profiles.zarr"
-    cache_path = tmp_path / "normalized_tensor.zarr"
+    cache_path = tmp_path / "normalized_tensor.npy"
 
     _create_profile_zarr(store_path, num_subs, sessions_per_sub,
                          n_targ, n_seed, rng)
@@ -990,8 +1016,8 @@ def test_load_profiles_tensor_caches_to_zarr(tmp_path):
     )
     assert cache_path.exists()
     # Cached data should match returned tensor
-    cached = zarr.open_array(str(cache_path), mode="r")[:]
-    np.testing.assert_array_equal(cached, tensor)
+    cached = np.load(str(cache_path))
+    np.testing.assert_array_equal(cached, np.asarray(tensor))
 
 
 def test_load_profiles_tensor_reuses_cache(tmp_path):
@@ -1001,7 +1027,7 @@ def test_load_profiles_tensor_reuses_cache(tmp_path):
     n_targ, n_seed = 10, 6
     sessions_per_sub = [1]
     store_path = tmp_path / "fc_profiles.zarr"
-    cache_path = tmp_path / "normalized_tensor.zarr"
+    cache_path = tmp_path / "normalized_tensor.npy"
 
     _create_profile_zarr(store_path, 1, sessions_per_sub,
                          n_targ, n_seed, rng)
@@ -1018,7 +1044,8 @@ def test_load_profiles_tensor_reuses_cache(tmp_path):
         store_path, 1, sessions_per_sub, cache_path=cache_path,
     )
     assert cache_path.stat().st_mtime == original_mtime
-    np.testing.assert_array_equal(tensor1, tensor2)
+    np.testing.assert_array_equal(
+        np.asarray(tensor1), np.asarray(tensor2))
 
 
 def test_load_profiles_tensor_overwrite_regenerates_cache(tmp_path):
@@ -1028,7 +1055,7 @@ def test_load_profiles_tensor_overwrite_regenerates_cache(tmp_path):
     n_targ, n_seed = 10, 6
     sessions_per_sub = [1]
     store_path = tmp_path / "fc_profiles.zarr"
-    cache_path = tmp_path / "normalized_tensor.zarr"
+    cache_path = tmp_path / "normalized_tensor.npy"
 
     _create_profile_zarr(store_path, 1, sessions_per_sub,
                          n_targ, n_seed, rng)
@@ -1049,7 +1076,7 @@ def test_load_profiles_tensor_overwrite_regenerates_cache(tmp_path):
 
 
 def test_run_wrapper_caches_normalized_tensor(tmp_path):
-    """Step 6 should create a cached normalized tensor Zarr."""
+    """Step 6 should create a cached normalized tensor .npy file."""
     rng = np.random.default_rng(42)
     num_clusters = 3
     csv_file, seed_labels, mock_params, mock_nb = _setup_num_clusters_run(
@@ -1074,7 +1101,7 @@ def test_run_wrapper_caches_normalized_tensor(tmp_path):
 
     profiles_dir = (result_dir / "Params_training" /
                     "generate_profiles_and_ini_params" / "profiles")
-    cache_path = profiles_dir / "normalized_tensor.zarr"
+    cache_path = profiles_dir / "normalized_tensor.npy"
     assert cache_path.exists()
 
 
@@ -1106,7 +1133,7 @@ def test_run_wrapper_overwrite_fc_invalidates_tensor_cache(tmp_path):
 
     profiles_dir = (result_dir / "Params_training" /
                     "generate_profiles_and_ini_params" / "profiles")
-    cache_path = profiles_dir / "normalized_tensor.zarr"
+    cache_path = profiles_dir / "normalized_tensor.npy"
     original_mtime = cache_path.stat().st_mtime
     time.sleep(0.05)
 
@@ -1183,3 +1210,103 @@ def test_run_wrapper_overwrite_kmeans_recomputes(tmp_path):
         )
 
     assert centroids_path.stat().st_mtime > original_mtime
+
+
+# ---------------------------------------------------------------------------
+# test__load_profiles_tensor with cortex_mask
+# ---------------------------------------------------------------------------
+
+def test_load_profiles_tensor_with_cortex_mask(tmp_path):
+    """Vertices outside cortex mask should be zeroed after loading."""
+    rng = np.random.default_rng(42)
+    n_targ, n_seed = 10, 6
+    n_vertices = 2 * n_targ
+    sessions_per_sub = [1]
+    store_path = tmp_path / "fc_profiles.zarr"
+
+    _create_profile_zarr(store_path, 1, sessions_per_sub,
+                         n_targ, n_seed, rng)
+
+    # Create cortex mask: vertices 0,1,2 are medial wall (False)
+    cortex_mask = np.ones(n_vertices, dtype=bool)
+    cortex_mask[0] = False
+    cortex_mask[1] = False
+    cortex_mask[2] = False
+
+    tensor = _load_profiles_tensor(
+        store_path, 1, sessions_per_sub, cortex_mask=cortex_mask,
+    )
+
+    # Medial wall vertices should be all-zero
+    np.testing.assert_array_equal(tensor[0, :, :, :], 0.0)
+    np.testing.assert_array_equal(tensor[1, :, :, :], 0.0)
+    np.testing.assert_array_equal(tensor[2, :, :, :], 0.0)
+
+    # Cortex vertices should be non-zero (row-normalized to unit norm)
+    for v in range(3, n_vertices):
+        assert np.any(tensor[v, :, :, :] != 0)
+
+
+def test_load_profiles_tensor_cortex_mask_cached(tmp_path):
+    """Cortex masking should be baked into the cached .npy file."""
+    rng = np.random.default_rng(42)
+    n_targ, n_seed = 10, 6
+    n_vertices = 2 * n_targ
+    sessions_per_sub = [1]
+    store_path = tmp_path / "fc_profiles.zarr"
+    cache_path = tmp_path / "normalized_tensor.npy"
+
+    _create_profile_zarr(store_path, 1, sessions_per_sub,
+                         n_targ, n_seed, rng)
+
+    cortex_mask = np.ones(n_vertices, dtype=bool)
+    cortex_mask[5] = False
+    cortex_mask[15] = False
+
+    # First call creates cache with masking applied
+    _load_profiles_tensor(
+        store_path, 1, sessions_per_sub,
+        cache_path=cache_path, cortex_mask=cortex_mask,
+    )
+
+    # Load from cache (no cortex_mask needed since it's baked in)
+    tensor = _load_profiles_tensor(
+        store_path, 1, sessions_per_sub, cache_path=cache_path,
+    )
+
+    np.testing.assert_array_equal(tensor[5, :, :, :], 0.0)
+    np.testing.assert_array_equal(tensor[15, :, :, :], 0.0)
+
+
+def test_detect_valid_vertices_after_cortex_masking(tmp_path):
+    """_detect_valid_vertices should correctly identify medial wall
+    vertices when cortex mask has been applied during loading."""
+    rng = np.random.default_rng(42)
+    n_targ, n_seed = 10, 6
+    n_vertices = 2 * n_targ
+    sessions_per_sub = [1]
+    store_path = tmp_path / "fc_profiles.zarr"
+
+    _create_profile_zarr(store_path, 1, sessions_per_sub,
+                         n_targ, n_seed, rng)
+
+    # Mark vertices 0, 5, 19 as medial wall
+    cortex_mask = np.ones(n_vertices, dtype=bool)
+    cortex_mask[0] = False
+    cortex_mask[5] = False
+    cortex_mask[19] = False
+
+    tensor = _load_profiles_tensor(
+        store_path, 1, sessions_per_sub, cortex_mask=cortex_mask,
+    )
+
+    valid = _detect_valid_vertices(tensor)
+
+    # Medial wall vertices should be detected as invalid
+    assert not valid[0]
+    assert not valid[5]
+    assert not valid[19]
+    # Cortex vertices should be valid
+    assert valid[1]
+    assert valid[10]
+    assert valid.sum() == n_vertices - 3

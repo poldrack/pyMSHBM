@@ -6,7 +6,11 @@ import nibabel.freesurfer as fs
 import numpy as np
 import pytest
 
-from pymshbm.io.freesurfer import compute_seed_labels, load_surface_neighborhood
+from pymshbm.io.freesurfer import (
+    compute_seed_labels,
+    load_cortex_mask,
+    load_surface_neighborhood,
+)
 
 
 def _make_sphere_surface(subjects_dir: Path, mesh: str, hemi: str,
@@ -245,3 +249,82 @@ def test_load_surface_neighborhood_no_cross_hemi(tmp_path):
     rh_nb = nb[n_lh:]
     valid_rh = rh_nb[rh_nb >= 0]
     assert np.all(valid_rh >= n_lh)
+
+
+# ---------------------------------------------------------------------------
+# Helpers for cortex mask tests
+# ---------------------------------------------------------------------------
+
+def _write_label_file(path: Path, vertex_indices: list[int]) -> None:
+    """Write a FreeSurfer .label file with given vertex indices."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"#!ascii label, from subject test\n"]
+    lines.append(f"{len(vertex_indices)}\n")
+    for idx in vertex_indices:
+        lines.append(f"{idx}  0.000  0.000  0.000 0.000000\n")
+    path.write_text("".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# test_load_cortex_mask
+# ---------------------------------------------------------------------------
+
+def test_load_cortex_mask_basic(tmp_path):
+    """Should return boolean mask with True for cortex vertices."""
+    n_vertices = 20
+    cortex_vertices = [0, 1, 3, 5, 7, 10, 15, 19]
+    _make_sphere_surface(tmp_path, "fsaverage6", "lh", n_vertices)
+    label_dir = tmp_path / "fsaverage6" / "label"
+    label_dir.mkdir(parents=True, exist_ok=True)
+    _write_label_file(label_dir / "lh.cortex.label", cortex_vertices)
+
+    mask = load_cortex_mask("fsaverage6", "lh", n_vertices,
+                            freesurfer_dir=tmp_path)
+
+    assert mask.shape == (n_vertices,)
+    assert mask.dtype == bool
+    assert mask.sum() == len(cortex_vertices)
+    for v in cortex_vertices:
+        assert mask[v]
+    # Non-cortex vertices should be False
+    for v in [2, 4, 6, 8, 9, 11, 12, 13, 14, 16, 17, 18]:
+        assert not mask[v]
+
+
+def test_load_cortex_mask_all_cortex(tmp_path):
+    """When all vertices are cortex, mask should be all True."""
+    n_vertices = 10
+    _make_sphere_surface(tmp_path, "fsaverage6", "lh", n_vertices)
+    label_dir = tmp_path / "fsaverage6" / "label"
+    label_dir.mkdir(parents=True, exist_ok=True)
+    _write_label_file(label_dir / "lh.cortex.label", list(range(n_vertices)))
+
+    mask = load_cortex_mask("fsaverage6", "lh", n_vertices,
+                            freesurfer_dir=tmp_path)
+    assert mask.all()
+
+
+def test_load_cortex_mask_missing_label_raises(tmp_path):
+    """Should raise FileNotFoundError when cortex label is missing."""
+    n_vertices = 10
+    _make_sphere_surface(tmp_path, "fsaverage6", "lh", n_vertices)
+
+    with pytest.raises(FileNotFoundError, match="cortex.label"):
+        load_cortex_mask("fsaverage6", "lh", n_vertices,
+                         freesurfer_dir=tmp_path)
+
+
+def test_load_cortex_mask_rh(tmp_path):
+    """Should work for right hemisphere too."""
+    n_vertices = 15
+    cortex_vertices = [0, 2, 4, 6, 8, 10, 12, 14]
+    _make_sphere_surface(tmp_path, "fsaverage6", "rh", n_vertices)
+    label_dir = tmp_path / "fsaverage6" / "label"
+    label_dir.mkdir(parents=True, exist_ok=True)
+    _write_label_file(label_dir / "rh.cortex.label", cortex_vertices)
+
+    mask = load_cortex_mask("fsaverage6", "rh", n_vertices,
+                            freesurfer_dir=tmp_path)
+
+    assert mask.shape == (n_vertices,)
+    assert mask.sum() == len(cortex_vertices)

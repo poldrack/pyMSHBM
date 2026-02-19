@@ -31,6 +31,43 @@ def _resolve_subjects_dir(freesurfer_dir: str | Path | None) -> Path:
     )
 
 
+def load_cortex_mask(
+    targ_mesh: str,
+    hemi: str,
+    n_vertices: int,
+    freesurfer_dir: str | Path | None = None,
+) -> np.ndarray:
+    """Load cortex label and return a boolean mask.
+
+    Reads ``{targ_mesh}/label/{hemi}.cortex.label`` from the FreeSurfer
+    subjects directory. Vertices listed in the label are cortex (True);
+    all others are medial wall (False).
+
+    Args:
+        targ_mesh: Target mesh name (e.g. "fsaverage6").
+        hemi: Hemisphere, "lh" or "rh".
+        n_vertices: Total number of vertices on this hemisphere.
+        freesurfer_dir: FreeSurfer subjects directory.
+
+    Returns:
+        Boolean array of shape (n_vertices,). True = cortex.
+
+    Raises:
+        FileNotFoundError: If the cortex.label file is missing.
+    """
+    subjects_dir = _resolve_subjects_dir(freesurfer_dir)
+    label_path = subjects_dir / targ_mesh / "label" / f"{hemi}.cortex.label"
+    if not label_path.exists():
+        raise FileNotFoundError(
+            f"Cortex label not found: {label_path}. "
+            f"Expected {hemi}.cortex.label in {subjects_dir / targ_mesh / 'label'}"
+        )
+    cortex_indices = fs.read_label(str(label_path))
+    mask = np.zeros(n_vertices, dtype=bool)
+    mask[cortex_indices] = True
+    return mask
+
+
 def compute_seed_labels(
     seed_mesh: str,
     targ_mesh: str,

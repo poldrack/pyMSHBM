@@ -13,7 +13,11 @@ import zarr
 
 from pymshbm.core.profiles import generate_ini_params, generate_profiles
 from pymshbm.io.cifti import write_dlabel_cifti
-from pymshbm.io.freesurfer import compute_seed_labels, load_surface_neighborhood
+from pymshbm.io.freesurfer import (
+    compute_seed_labels,
+    load_cortex_mask,
+    load_surface_neighborhood,
+)
 from pymshbm.io.profile_lists import write_profile_list
 from pymshbm.io.readers import read_fmri
 from pymshbm.pipeline.single_subject import parcellation_single_subject
@@ -204,19 +208,35 @@ def _load_profiles_tensor(
     sessions_per_sub: list[int],
     cache_path: Path | None = None,
     overwrite: bool = False,
+    cortex_mask: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Load profiles from Zarr, row-normalize, and optionally cache.
+    """Load profiles from Zarr, row-normalize, and cache as memory-mapped .npy.
+
+    Args:
+        store_path: Path to the Zarr profiles store.
+        num_subs: Number of subjects.
+        sessions_per_sub: Sessions per subject.
+        cache_path: Optional path for caching the normalized tensor.
+        overwrite: If True, regenerate even when cached.
+        cortex_mask: Optional boolean mask (N,). When provided, medial
+            wall vertices (False entries) are zeroed **before**
+            normalization, matching MATLAB CBIG behavior.
 
     Returns:
-        (N, D, S, max_T) float64, row-normalized. NaN → 0 for
-        unwritten sessions.
+        (N, D, S, max_T) row-normalized array. NaN → 0 for unwritten
+        sessions. When cache_path is provided, returns a memory-mapped
+        array so the OS can page data in/out on demand.
     """
     if cache_path is not None and cache_path.exists() and not overwrite:
         logger.info("  Reusing cached normalized tensor from %s", cache_path)
-        return zarr.open_array(str(cache_path), mode="r")[:]
+        return np.load(str(cache_path), mmap_mode="r")
 
     data = zarr.open_array(str(store_path), mode="r")[:]
     np.nan_to_num(data, nan=0.0, copy=False)
+
+    # Zero out medial wall vertices before normalization
+    if cortex_mask is not None:
+        data[~cortex_mask] = 0.0
 
     # Vectorized row normalization across all (sub, session) slices
     norms = np.linalg.norm(data, axis=1, keepdims=True)
@@ -225,8 +245,9 @@ def _load_profiles_tensor(
 
     if cache_path is not None:
         if cache_path.exists():
-            shutil.rmtree(cache_path)
-        zarr.save(str(cache_path), data)
+            cache_path.unlink()
+        np.save(str(cache_path), data)
+        return np.load(str(cache_path), mmap_mode="r")
 
     return data
 
@@ -306,6 +327,30 @@ def _write_parcellations_cifti(
             lh_labels, rh_labels, out_path,
             num_vertices_lh, num_vertices_rh,
         )
+
+
+def _load_cortex_masks(
+    targ_mesh: str,
+    n_targ: int,
+    freesurfer_dir: str | Path | None,
+) -> np.ndarray | None:
+    """Load and concatenate lh+rh cortex masks, or None if unavailable."""
+    try:
+        cortex_lh = load_cortex_mask(
+            targ_mesh, "lh", n_targ, freesurfer_dir)
+        cortex_rh = load_cortex_mask(
+            targ_mesh, "rh", n_targ, freesurfer_dir)
+        mask = np.concatenate([cortex_lh, cortex_rh])
+        n_cortex = int(mask.sum())
+        n_total = len(mask)
+        logger.info("  Cortex mask: %d/%d vertices are cortex (%.1f%% medial wall)",
+                    n_cortex, n_total, (1 - n_cortex / n_total) * 100)
+        return mask
+    except (FileNotFoundError, ValueError, IndexError):
+        logger.warning(
+            "  Cortex labels not available for %s — medial wall "
+            "detection will rely on zero-profile heuristic", targ_mesh)
+        return None
 
 
 def _create_directory_structure(base_dir: Path) -> dict[str, Path]:
@@ -466,20 +511,36 @@ def run_wrapper(
     if num_clusters is not None:
         subject_ids = [s[0] for s in subjects]
 
+        # Load cortex masks for medial wall zeroing
+        cortex_mask = _load_cortex_masks(
+            targ_mesh, n_targ, freesurfer_dir)
+
         # Step 6: Load profiles tensor + detect medial wall
         logger.info("Step 6/%d: Loading profiles into training tensor",
                     total_steps)
-        tensor_cache = dirs["profiles"] / "normalized_tensor.zarr"
+        tensor_cache = dirs["profiles"] / "normalized_tensor.npy"
         data_full = _load_profiles_tensor(
             store_path, len(subjects), sessions_per_sub,
             cache_path=tensor_cache, overwrite=overwrite_fc,
+            cortex_mask=cortex_mask,
         )
         valid_mask = _detect_valid_vertices(data_full)
         n_valid = int(valid_mask.sum())
         n_full = data_full.shape[0]
         logger.info("  %d/%d vertices are non-medial-wall (%.0f%% reduction)",
                     n_valid, n_full, (1 - n_valid / n_full) * 100)
-        data_reduced = data_full[valid_mask]
+
+        # Cache the reduced tensor for memory-mapped access
+        reduced_cache = dirs["profiles"] / "reduced_tensor.npy"
+        if reduced_cache.exists() and not overwrite_fc:
+            data_reduced = np.load(str(reduced_cache), mmap_mode="r")
+        else:
+            data_reduced = np.asarray(data_full[valid_mask])
+            if reduced_cache.exists():
+                reduced_cache.unlink()
+            np.save(str(reduced_cache), data_reduced)
+            del data_reduced
+            data_reduced = np.load(str(reduced_cache), mmap_mode="r")
 
         # Step 7: Compute initial centroids (on reduced vertices)
         logger.info("Step 7/%d: Computing initial centroids via k-means",
