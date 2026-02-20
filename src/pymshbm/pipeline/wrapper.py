@@ -7,6 +7,7 @@ import csv
 import logging
 import os
 import shutil
+import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
@@ -343,6 +344,18 @@ def _parcellation_subject_worker(s, n_sess, params, neighborhood,
     return s, lh_labels, rh_labels
 
 
+def _log_label_stats(sid, lh_labels, rh_labels):
+    """Log per-subject label distribution at DEBUG level."""
+    all_labels = np.concatenate([lh_labels, rh_labels])
+    n_total = len(all_labels)
+    n_labeled = int(np.sum(all_labels > 0))
+    unique = np.unique(all_labels[all_labels > 0])
+    logger.debug("  %s labels: %d/%d assigned, %d unique parcels, "
+                 "lh_nonzero=%d, rh_nonzero=%d",
+                 sid, n_labeled, n_total, len(unique),
+                 int(np.sum(lh_labels > 0)), int(np.sum(rh_labels > 0)))
+
+
 def _write_parcellations_cifti(
     results: list[tuple[np.ndarray, np.ndarray]],
     subject_ids: list[str],
@@ -622,6 +635,10 @@ def run_wrapper(
         )
         n_targ = data_full.shape[0] // 2
         n_subjects = len(subject_ids)
+        logger.debug("  Data shape: %s, neighborhood shape: %s, "
+                     "max_iter=%d, L=%d",
+                     data_full.shape, neighborhood.shape,
+                     max_iter, L)
 
         # Parallel path: use ProcessPoolExecutor when data is memory-mapped
         use_parallel = (
@@ -629,7 +646,11 @@ def run_wrapper(
             and isinstance(data_full, np.memmap)
             and getattr(data_full, "filename", None) is not None
         )
+        logger.debug("  Parallel mode: %s (memmap=%s, n_subjects=%d)",
+                     use_parallel, isinstance(data_full, np.memmap),
+                     n_subjects)
 
+        step9_start = time.monotonic()
         results = [None] * n_subjects
         if use_parallel:
             data_path = data_full.filename
@@ -641,22 +662,26 @@ def run_wrapper(
                 initializer=_init_parcellation_worker,
                 initargs=(data_path,),
             ) as pool:
-                futures = []
+                futures = {}
                 for s, sid in enumerate(subject_ids):
                     n_sess = sessions_per_sub[s]
                     logger.info("  Submitting %s (%d sessions)", sid, n_sess)
-                    futures.append(pool.submit(
+                    future = pool.submit(
                         _parcellation_subject_worker, s, n_sess, params,
                         neighborhood, spatial_weight, mrf_weight, max_iter,
-                    ))
+                    )
+                    futures[future] = sid
                 for future in futures:
                     s, lh_labels, rh_labels = future.result()
+                    sid = futures[future]
                     results[s] = (lh_labels, rh_labels)
+                    _log_label_stats(sid, lh_labels, rh_labels)
         else:
             for s, sid in enumerate(subject_ids):
                 n_sess = sessions_per_sub[s]
                 sub_data = data_full[:, :, s:s + 1, :n_sess]
                 logger.info("  %s (%d sessions)", sid, n_sess)
+                sub_start = time.monotonic()
                 lh_labels, rh_labels = parcellation_single_subject(
                     data=sub_data,
                     group_priors=params,
@@ -665,7 +690,15 @@ def run_wrapper(
                     c=mrf_weight,
                     max_iter=max_iter,
                 )
+                sub_elapsed = time.monotonic() - sub_start
                 results[s] = (lh_labels, rh_labels)
+                logger.debug("  %s completed in %.1fs", sid, sub_elapsed)
+                _log_label_stats(sid, lh_labels, rh_labels)
+
+        step9_elapsed = time.monotonic() - step9_start
+        logger.debug("  Step 9 total: %.1fs for %d subjects (%.1fs/subject)",
+                     step9_elapsed, n_subjects,
+                     step9_elapsed / max(n_subjects, 1))
 
         # Step 10: Write CIFTI parcellations
         logger.info("Step 10/%d: Writing CIFTI parcellations", total_steps)

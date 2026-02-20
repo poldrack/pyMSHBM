@@ -1,10 +1,14 @@
 """Generate individual parcellations using group priors + MRF smoothness."""
 
+import logging
+
 import numpy as np
 
 from pymshbm.math.mrf import build_sparse_adjacency, v_lambda_product
 from pymshbm.math.vmf import cdln, inv_ad_batch, vmf_log_probability
 from pymshbm.types import MSHBMParams
+
+logger = logging.getLogger(__name__)
 
 
 def generate_individual_parcellation(
@@ -32,12 +36,18 @@ def generate_individual_parcellation(
     L = group_priors.mu.shape[1]
     dim = D - 1
 
+    logger.debug("Individual parcellation: N=%d, D=%d, S=%d, T=%d, L=%d",
+                 N, D, S, T, L)
+
     if dim < 1200:
         ini_concentration = 500
     elif dim < 1800:
         ini_concentration = 650
     else:
         raise ValueError(f"Dimension {dim} too high")
+
+    logger.debug("ini_concentration=%d, w=%.1f, c=%.1f, max_iter=%d",
+                 ini_concentration, w, c, max_iter)
 
     # Initialize from group priors (read-only params don't need copy)
     mu = group_priors.mu
@@ -54,6 +64,9 @@ def generate_individual_parcellation(
 
     # Identify valid (non-medial-wall) vertices
     valid_mask = s_lambda[:, :, 0].sum(axis=1) != 0
+    n_valid = int(valid_mask.sum())
+    logger.debug("Valid (non-medial-wall) vertices: %d/%d (%.1f%%)",
+                 n_valid, N, n_valid / max(N, 1) * 100)
 
     # Build V_same and V_diff
     v_same = np.zeros_like(neighborhood, dtype=np.float64)
@@ -61,6 +74,8 @@ def generate_individual_parcellation(
 
     # Build sparse adjacency once for MRF fast-path
     adj_sparse = build_sparse_adjacency(neighborhood)
+    logger.debug("Sparse adjacency: shape=%s, nnz=%d",
+                 adj_sparse.shape, adj_sparse.nnz)
 
     cost = 0.0
     for iteration in range(1, max_iter + 1):
@@ -84,9 +99,17 @@ def generate_individual_parcellation(
             kappa, theta, dim, log_vmf_cached=log_vmf_cached,
         )
         if iteration > 1 and abs(cost) > 0:
-            if abs((update_cost - cost) / cost) <= 1e-4:
+            rel_change = abs((update_cost - cost) / cost)
+            logger.debug("Outer iter %d/%d: cost=%.6f, rel_change=%.2e",
+                         iteration, max_iter, update_cost, rel_change)
+            if rel_change <= 1e-4:
+                logger.debug("Outer loop converged at iteration %d", iteration)
                 break
+        else:
+            logger.debug("Outer iter %d/%d: cost=%.6f",
+                         iteration, max_iter, update_cost)
         if iteration >= max_iter:
+            logger.debug("Outer loop reached max_iter=%d", max_iter)
             break
         cost = update_cost
 
@@ -95,6 +118,11 @@ def generate_individual_parcellation(
     active = s_lambda[:, :, 0].sum(axis=1) != 0
     if np.any(active):
         labels[active] = np.argmax(s_lambda[active, :, 0], axis=1) + 1
+
+    n_labeled = int(np.sum(labels > 0))
+    unique_labels = np.unique(labels[labels > 0])
+    logger.debug("Labels assigned: %d/%d vertices, %d unique labels: %s",
+                 n_labeled, N, len(unique_labels), unique_labels)
 
     return labels
 
@@ -182,7 +210,8 @@ def _vmf_em(data, s_lambda, kappa, s_t_nu, s_psi, sigma, theta,
     log_vmf_cached = {}
     for iter_em in range(1, 102):
         # M-step: update kappa and s_t_nu
-        for _ in range(50):
+        m_step_iters = 0
+        for m_iter in range(50):
             kappa_num = 0.0
             kappa_den = 0.0
             for s in range(S):
@@ -218,8 +247,14 @@ def _vmf_em(data, s_lambda, kappa, s_t_nu, s_psi, sigma, theta,
                         converged = False
                     s_t_nu[:, :, t, s] = nu_new
 
+            m_step_iters = m_iter + 1
             if converged:
                 break
+
+        logger.debug("  EM iter %d: M-step converged in %d iters, "
+                     "kappa=%.2f, rbar=%.6f",
+                     iter_em, m_step_iters, kappa[0],
+                     rbar if kappa_den > 0 else float('nan'))
 
         # Opt 2: Precompute log_c once after M-step
         log_c = cdln(kappa, dim)
@@ -231,7 +266,8 @@ def _vmf_em(data, s_lambda, kappa, s_t_nu, s_psi, sigma, theta,
             )
 
         # E-step with MRF
-        for _ in range(100):
+        e_step_iters = 0
+        for e_iter in range(100):
             for s in range(S):
                 # Reuse cached log_vmf (Opt 1)
                 log_vmf_total = log_vmf_cached[s]
@@ -256,8 +292,12 @@ def _vmf_em(data, s_lambda, kappa, s_t_nu, s_psi, sigma, theta,
                 change = np.mean(np.abs(sl_new - s_lambda[:, :, s]))
                 s_lambda[:, :, s] = sl_new
 
+            e_step_iters = e_iter + 1
             if change <= epsilon:
                 break
+
+        logger.debug("  EM iter %d: E-step converged in %d iters, "
+                     "mean_change=%.2e", iter_em, e_step_iters, change)
 
         # Cost convergence (reuse cached log_vmf, Opt 1)
         update_cost = np.zeros(S)
@@ -274,9 +314,25 @@ def _vmf_em(data, s_lambda, kappa, s_t_nu, s_psi, sigma, theta,
                 np.abs((update_cost - cost) / cost) <= epsilon,
                 False,
             )
+
+        if iter_em > 1 and np.any(np.abs(cost) > 0):
+            rel_changes = np.where(
+                np.abs(cost) > 0,
+                np.abs((update_cost - cost) / cost),
+                float('inf'),
+            )
+            logger.debug("  EM iter %d: cost=%s, rel_change=%s, "
+                         "converged_subs=%s",
+                         iter_em,
+                         np.array2string(update_cost, precision=4),
+                         np.array2string(rel_changes, precision=2),
+                         np.array2string(converged_subs))
+
         if np.all(converged_subs) and iter_em > 1:
+            logger.debug("  Inner EM converged at iteration %d", iter_em)
             break
         if iter_em > 100:
+            logger.debug("  Inner EM reached max iterations (101)")
             break
         cost = update_cost
 
