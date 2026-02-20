@@ -1434,3 +1434,40 @@ def test_detect_valid_vertices_after_cortex_masking(tmp_path):
     assert valid[1]
     assert valid[10]
     assert valid.sum() == n_vertices - 3
+
+
+# ---------------------------------------------------------------------------
+# test_run_wrapper_parallel_subjects
+# ---------------------------------------------------------------------------
+
+def test_run_wrapper_parallel_subjects(tmp_path):
+    """Step 9 should process all subjects and create CIFTI for each."""
+    rng = np.random.default_rng(42)
+    num_clusters = 3
+    n_subs = 3
+    csv_file, seed_labels, mock_params, mock_nb = _setup_num_clusters_run(
+        tmp_path, rng, num_clusters=num_clusters, n_subs=n_subs, n_sess=1,
+    )
+
+    with patch("pymshbm.pipeline.wrapper.params_training",
+               return_value=mock_params), \
+         patch("pymshbm.pipeline.wrapper.parcellation_single_subject",
+               side_effect=_mock_parcellation), \
+         patch("pymshbm.pipeline.wrapper.load_surface_neighborhood",
+               return_value=mock_nb):
+        result_dir = run_wrapper(
+            sub_list=csv_file,
+            output_dir=tmp_path / "output",
+            seed_labels_lh=seed_labels,
+            seed_labels_rh=seed_labels,
+            seed_mesh="fsaverage3",
+            targ_mesh="fsaverage6",
+            num_clusters=num_clusters,
+        )
+
+    # All subjects should have CIFTI outputs
+    cifti_dir = result_dir / "cifti_parcellations"
+    assert cifti_dir.exists()
+    for i in range(1, n_subs + 1):
+        dlabel = cifti_dir / f"sub{i:03d}.dlabel.nii"
+        assert dlabel.exists(), f"Missing {dlabel}"

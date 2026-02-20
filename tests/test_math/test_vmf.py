@@ -130,6 +130,23 @@ class TestInvAdBatch:
         assert result.shape == (1,)
         assert np.isfinite(result[0])
 
+    def test_inv_ad_batch_matches_inv_ad_scalar(self):
+        """inv_ad_batch[0] should closely match scalar inv_ad for various rbar values.
+
+        Both methods solve A_d(kappa) = rbar using different root-finding
+        approaches (brentq vs Halley). Tolerance of 1% is appropriate since
+        both are used in iterative EM where exact agreement isn't needed.
+        """
+        d = 100
+        rbar_values = [0.1, 0.3, 0.5, 0.7, 0.9]
+        for rbar in rbar_values:
+            scalar_result = inv_ad(d, rbar)
+            batch_result = float(inv_ad_batch(d, np.array([rbar]))[0])
+            assert batch_result == pytest.approx(scalar_result, rel=1e-2), (
+                f"Mismatch for rbar={rbar}: scalar={scalar_result}, "
+                f"batch={batch_result}"
+            )
+
 
 class TestVmfLogProbability:
     """Tests for the vMF log probability."""

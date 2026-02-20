@@ -2,8 +2,8 @@
 
 import numpy as np
 
-from pymshbm.math.mrf import v_lambda_product
-from pymshbm.math.vmf import cdln, inv_ad, vmf_log_probability
+from pymshbm.math.mrf import build_sparse_adjacency, v_lambda_product
+from pymshbm.math.vmf import cdln, inv_ad_batch, vmf_log_probability
 from pymshbm.types import MSHBMParams
 
 
@@ -39,25 +39,28 @@ def generate_individual_parcellation(
     else:
         raise ValueError(f"Dimension {dim} too high")
 
-    # Initialize from group priors
-    mu = group_priors.mu.copy()
-    epsil = group_priors.epsil.copy()
-    sigma = group_priors.sigma.copy()
-    theta = group_priors.theta.copy()
+    # Initialize from group priors (read-only params don't need copy)
+    mu = group_priors.mu
+    epsil = group_priors.epsil
+    sigma = group_priors.sigma
+    theta = group_priors.theta
     kappa = np.full(L, ini_concentration, dtype=np.float64)
     s_psi = np.tile(mu[:, :, np.newaxis], (1, 1, 1))
     s_t_nu = np.tile(mu[:, :, np.newaxis, np.newaxis], (1, 1, T, 1))
 
-    # Initialize s_lambda
-    s_lambda = _init_s_lambda(data, s_t_nu, kappa, dim, L)
+    # Initialize s_lambda with precomputed log_c
+    log_c = cdln(kappa, dim)
+    s_lambda = _init_s_lambda(data, s_t_nu, kappa, dim, L, log_c=log_c)
 
     # Identify valid (non-medial-wall) vertices
     valid_mask = s_lambda[:, :, 0].sum(axis=1) != 0
 
     # Build V_same and V_diff
-    n_valid = neighborhood.shape[0]
     v_same = np.zeros_like(neighborhood, dtype=np.float64)
     v_diff = np.ones_like(neighborhood, dtype=np.float64)
+
+    # Build sparse adjacency once for MRF fast-path
+    adj_sparse = build_sparse_adjacency(neighborhood)
 
     cost = 0.0
     for iteration in range(1, max_iter + 1):
@@ -66,17 +69,20 @@ def generate_individual_parcellation(
         s_t_nu = np.tile(mu[:, :, np.newaxis, np.newaxis], (1, 1, T, 1))
 
         # Session-level clustering
-        s_lambda, kappa, s_t_nu = _vmf_em(
+        s_lambda, kappa, s_t_nu, log_vmf_cached = _vmf_em(
             data, s_lambda, kappa, s_t_nu, s_psi, sigma, theta,
             neighborhood, v_same, v_diff, w, c, dim, L, ini_concentration,
-            valid_mask,
+            valid_mask, adj_sparse=adj_sparse,
         )
 
         # Intra-subject update (single iteration for individual parcellation)
         s_psi = _update_s_psi(s_t_nu, sigma, epsil, mu)
 
-        # Convergence check
-        update_cost = _compute_cost(data, s_lambda, s_t_nu, s_psi, sigma, mu, epsil, kappa, theta, dim)
+        # Convergence check (reuse cached log_vmf from _vmf_em)
+        update_cost = _compute_cost(
+            data, s_lambda, s_t_nu, s_psi, sigma, mu, epsil,
+            kappa, theta, dim, log_vmf_cached=log_vmf_cached,
+        )
         if iteration > 1 and abs(cost) > 0:
             if abs((update_cost - cost) / cost) <= 1e-4:
                 break
@@ -115,17 +121,16 @@ def build_neighborhood(
     return neighborhood
 
 
-def _init_s_lambda(data, s_t_nu, kappa, dim, L):
+def _init_s_lambda(data, s_t_nu, kappa, dim, L, log_c=None):
     """Initialize s_lambda via vMF log likelihood."""
     N, D, S, T = data.shape
+    if log_c is None:
+        log_c = cdln(kappa, dim)
     s_lambda = np.zeros((N, L, S))
     for s in range(S):
-        log_vmf_total = np.zeros((N, L))
-        for t in range(T):
-            X = data[:, :, s, t]
-            nu = s_t_nu[:, :, t, s]
-            lv = vmf_log_probability(X, nu, kappa)
-            log_vmf_total += np.nan_to_num(lv, nan=0.0)
+        log_vmf_total = _compute_log_vmf_vectorized(
+            data, s_t_nu, kappa, s, log_c,
+        )
 
         log_vmf_total -= log_vmf_total.max(axis=1, keepdims=True)
         sl = np.exp(log_vmf_total)
@@ -139,14 +144,42 @@ def _init_s_lambda(data, s_t_nu, kappa, dim, L):
     return s_lambda
 
 
+def _compute_log_vmf_vectorized(data, s_t_nu, kappa, s, log_c):
+    """Compute sum of vMF log-likelihoods across timepoints using einsum.
+
+    Args:
+        data: (N, D, S, T) data array.
+        s_t_nu: (D, L, T, S) mean directions.
+        kappa: (L,) concentrations.
+        s: Session index.
+        log_c: (L,) precomputed log normalizing constants.
+
+    Returns:
+        (N, L) total log-likelihood summed over T.
+    """
+    T = data.shape[3]
+    data_s = data[:, :, s, :]  # (N, D, T)
+    nu_s = s_t_nu[:, :, :, s]  # (D, L, T)
+    # Compute dot products for all timepoints at once
+    dots = np.einsum('ndt,dlt->ntl', data_s, nu_s)  # (N, T, L)
+    dot_sum = dots.sum(axis=1)  # (N, L)
+    log_vmf_total = T * log_c[np.newaxis, :] + kappa[np.newaxis, :] * dot_sum
+    return np.nan_to_num(log_vmf_total, nan=0.0)
+
+
 def _vmf_em(data, s_lambda, kappa, s_t_nu, s_psi, sigma, theta,
             neighborhood, v_same, v_diff, w, c, dim, L, ini_concentration,
-            valid_mask):
+            valid_mask, adj_sparse=None):
     """Inner EM loop with MRF smoothness."""
     N, D, S, T = data.shape
     epsilon = 1e-4
+    tiny = np.finfo(float).tiny
+
+    # Hoist constant log_theta before E-step loop (Opt 4)
+    log_theta = np.log(np.maximum(theta, tiny))
 
     cost = np.zeros(S)
+    log_vmf_cached = {}
     for iter_em in range(1, 102):
         # M-step: update kappa and s_t_nu
         for _ in range(50):
@@ -163,7 +196,8 @@ def _vmf_em(data, s_lambda, kappa, s_t_nu, s_psi, sigma, theta,
             if kappa_den > 0:
                 rbar = kappa_num / (kappa_den * T)
                 rbar = min(max(rbar, 1e-10), 1 - 1e-10)
-                kappa_new = inv_ad(dim, rbar)
+                # Opt 7: use inv_ad_batch instead of scalar inv_ad
+                kappa_new = float(inv_ad_batch(dim, np.array([rbar]))[0])
                 kappa_new = max(kappa_new, ini_concentration)
                 if np.isinf(kappa_new):
                     kappa_new = kappa[0]
@@ -187,22 +221,29 @@ def _vmf_em(data, s_lambda, kappa, s_t_nu, s_psi, sigma, theta,
             if converged:
                 break
 
+        # Opt 2: Precompute log_c once after M-step
+        log_c = cdln(kappa, dim)
+
+        # Opt 1: Cache log_vmf after M-step (reuse across all 100 E-step iters)
+        for s in range(S):
+            log_vmf_cached[s] = _compute_log_vmf_vectorized(
+                data, s_t_nu, kappa, s, log_c,
+            )
+
         # E-step with MRF
         for _ in range(100):
             for s in range(S):
-                log_vmf_total = np.zeros((N, L))
-                for t in range(T):
-                    X = data[:, :, s, t]
-                    nu = s_t_nu[:, :, t, s]
-                    lv = vmf_log_probability(X, nu, kappa)
-                    log_vmf_total += np.nan_to_num(lv, nan=0.0)
+                # Reuse cached log_vmf (Opt 1)
+                log_vmf_total = log_vmf_cached[s]
 
-                # MRF term
+                # MRF term (Opt 6: sparse fast-path)
                 V_temp = np.zeros((N, L))
                 if c > 0:
-                    V_temp = v_lambda_product(neighborhood, v_same, v_diff, s_lambda[:, :, s])
+                    V_temp = v_lambda_product(
+                        neighborhood, v_same, v_diff, s_lambda[:, :, s],
+                        adjacency_matrix=adj_sparse,
+                    )
 
-                log_theta = np.log(np.maximum(theta, np.finfo(float).tiny))
                 log_posterior = log_vmf_total + w * log_theta - 2 * c * V_temp
 
                 log_posterior -= log_posterior.max(axis=1, keepdims=True)
@@ -218,18 +259,12 @@ def _vmf_em(data, s_lambda, kappa, s_t_nu, s_psi, sigma, theta,
             if change <= epsilon:
                 break
 
-        # Cost convergence
+        # Cost convergence (reuse cached log_vmf, Opt 1)
         update_cost = np.zeros(S)
         for s in range(S):
-            log_vmf_total = np.zeros((N, L))
-            for t in range(T):
-                X = data[:, :, s, t]
-                nu = s_t_nu[:, :, t, s]
-                lv = vmf_log_probability(X, nu, kappa)
-                log_vmf_total += np.nan_to_num(lv, nan=0.0)
+            log_vmf_total = log_vmf_cached[s]
             sl = s_lambda[:, :, s]
-            log_theta = np.log(np.maximum(theta, np.finfo(float).tiny))
-            log_sl = np.log(np.maximum(sl, np.finfo(float).tiny))
+            log_sl = np.log(np.maximum(sl, tiny))
             update_cost[s] = np.nansum(sl * log_vmf_total) + \
                 np.nansum(sl * w * log_theta) - np.nansum(sl * log_sl)
 
@@ -245,7 +280,7 @@ def _vmf_em(data, s_lambda, kappa, s_t_nu, s_psi, sigma, theta,
             break
         cost = update_cost
 
-    return s_lambda, kappa, s_t_nu
+    return s_lambda, kappa, s_t_nu, log_vmf_cached
 
 
 def _update_s_psi(s_t_nu, sigma, epsil, mu):
@@ -263,19 +298,23 @@ def _update_s_psi(s_t_nu, sigma, epsil, mu):
     return s_psi
 
 
-def _compute_cost(data, s_lambda, s_t_nu, s_psi, sigma, mu, epsil, kappa, theta, dim):
+def _compute_cost(data, s_lambda, s_t_nu, s_psi, sigma, mu, epsil,
+                  kappa, theta, dim, log_vmf_cached=None):
     """Compute total cost for convergence checking."""
     N, D, S, T = data.shape
+    tiny = np.finfo(float).tiny
+    log_theta = np.log(np.maximum(theta, tiny))
     total = 0.0
     for s in range(S):
-        log_vmf_total = np.zeros((N, s_lambda.shape[1]))
-        for t in range(T):
-            X = data[:, :, s, t]
-            nu = s_t_nu[:, :, t, s]
-            lv = vmf_log_probability(X, nu, kappa)
-            log_vmf_total += np.nan_to_num(lv, nan=0.0)
+        if log_vmf_cached is not None and s in log_vmf_cached:
+            log_vmf_total = log_vmf_cached[s]
+        else:
+            log_c = cdln(kappa, dim)
+            log_vmf_total = _compute_log_vmf_vectorized(
+                data, s_t_nu, kappa, s, log_c,
+            )
         sl = s_lambda[:, :, s]
-        log_theta = np.log(np.maximum(theta, np.finfo(float).tiny))
-        log_sl = np.log(np.maximum(sl, np.finfo(float).tiny))
-        total += np.nansum(sl * log_vmf_total) + np.nansum(sl * log_theta) - np.nansum(sl * log_sl)
+        log_sl = np.log(np.maximum(sl, tiny))
+        total += np.nansum(sl * log_vmf_total) + \
+            np.nansum(sl * log_theta) - np.nansum(sl * log_sl)
     return total

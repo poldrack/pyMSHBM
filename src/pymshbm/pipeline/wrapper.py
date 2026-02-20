@@ -5,7 +5,9 @@ Plug-in replacement for MSHBM_wrapper.m.
 
 import csv
 import logging
+import os
 import shutil
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -313,6 +315,34 @@ def _compute_initial_centroids(
     return centroids
 
 
+# ---------------------------------------------------------------------------
+# Parallel parcellation workers (Opt 5)
+# ---------------------------------------------------------------------------
+
+_parcellation_worker_data = None
+
+
+def _init_parcellation_worker(data_path):
+    """Initialize worker process with memory-mapped data."""
+    global _parcellation_worker_data
+    _parcellation_worker_data = np.load(str(data_path), mmap_mode="r")
+
+
+def _parcellation_subject_worker(s, n_sess, params, neighborhood,
+                                 spatial_weight, mrf_weight, max_iter):
+    """Run parcellation for a single subject in a worker process."""
+    sub_data = _parcellation_worker_data[:, :, s:s + 1, :n_sess]
+    lh_labels, rh_labels = parcellation_single_subject(
+        data=sub_data,
+        group_priors=params,
+        neighborhood=neighborhood,
+        w=spatial_weight,
+        c=mrf_weight,
+        max_iter=max_iter,
+    )
+    return s, lh_labels, rh_labels
+
+
 def _write_parcellations_cifti(
     results: list[tuple[np.ndarray, np.ndarray]],
     subject_ids: list[str],
@@ -590,21 +620,52 @@ def run_wrapper(
         neighborhood = load_surface_neighborhood(
             targ_mesh, freesurfer_dir,
         )
-        results = []
         n_targ = data_full.shape[0] // 2
-        for s, sid in enumerate(subject_ids):
-            n_sess = sessions_per_sub[s]
-            sub_data = data_full[:, :, s:s + 1, :n_sess]
-            logger.info("  %s (%d sessions)", sid, n_sess)
-            lh_labels, rh_labels = parcellation_single_subject(
-                data=sub_data,
-                group_priors=params,
-                neighborhood=neighborhood,
-                w=spatial_weight,
-                c=mrf_weight,
-                max_iter=max_iter,
-            )
-            results.append((lh_labels, rh_labels))
+        n_subjects = len(subject_ids)
+
+        # Parallel path: use ProcessPoolExecutor when data is memory-mapped
+        use_parallel = (
+            n_subjects > 1
+            and isinstance(data_full, np.memmap)
+            and getattr(data_full, "filename", None) is not None
+        )
+
+        results = [None] * n_subjects
+        if use_parallel:
+            data_path = data_full.filename
+            n_workers = min(n_subjects, os.cpu_count() or 1)
+            logger.info("  Parallel parcellation: %d workers for %d subjects",
+                        n_workers, n_subjects)
+            with ProcessPoolExecutor(
+                max_workers=n_workers,
+                initializer=_init_parcellation_worker,
+                initargs=(data_path,),
+            ) as pool:
+                futures = []
+                for s, sid in enumerate(subject_ids):
+                    n_sess = sessions_per_sub[s]
+                    logger.info("  Submitting %s (%d sessions)", sid, n_sess)
+                    futures.append(pool.submit(
+                        _parcellation_subject_worker, s, n_sess, params,
+                        neighborhood, spatial_weight, mrf_weight, max_iter,
+                    ))
+                for future in futures:
+                    s, lh_labels, rh_labels = future.result()
+                    results[s] = (lh_labels, rh_labels)
+        else:
+            for s, sid in enumerate(subject_ids):
+                n_sess = sessions_per_sub[s]
+                sub_data = data_full[:, :, s:s + 1, :n_sess]
+                logger.info("  %s (%d sessions)", sid, n_sess)
+                lh_labels, rh_labels = parcellation_single_subject(
+                    data=sub_data,
+                    group_priors=params,
+                    neighborhood=neighborhood,
+                    w=spatial_weight,
+                    c=mrf_weight,
+                    max_iter=max_iter,
+                )
+                results[s] = (lh_labels, rh_labels)
 
         # Step 10: Write CIFTI parcellations
         logger.info("Step 10/%d: Writing CIFTI parcellations", total_steps)

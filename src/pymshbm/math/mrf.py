@@ -1,6 +1,24 @@
 """MRF V*lambda product (replaces compiled MEX function)."""
 
 import numpy as np
+import scipy.sparse as sp
+
+
+def build_sparse_adjacency(neighborhood: np.ndarray) -> sp.csr_matrix:
+    """Build a sparse CSR adjacency matrix from a neighborhood array.
+
+    Args:
+        neighborhood: (N, max_neighbors) vertex neighbor indices; -1 = invalid.
+
+    Returns:
+        (N, N) CSR sparse matrix with 1.0 for each valid neighbor entry.
+    """
+    N, max_nb = neighborhood.shape
+    valid = neighborhood >= 0
+    rows = np.repeat(np.arange(N), max_nb)[valid.ravel()]
+    cols = neighborhood[valid]
+    data = np.ones(len(rows), dtype=np.float64)
+    return sp.csr_matrix((data, (rows, cols)), shape=(N, N))
 
 
 def v_lambda_product(
@@ -8,6 +26,7 @@ def v_lambda_product(
     v_same: np.ndarray,
     v_diff: np.ndarray,
     lam: np.ndarray,
+    adjacency_matrix: sp.csr_matrix | None = None,
 ) -> np.ndarray:
     """Compute V*lambda product for MRF smoothness prior.
 
@@ -28,6 +47,15 @@ def v_lambda_product(
     """
     N, K = lam.shape
     max_nb = neighborhood.shape[1]
+
+    # Fast-path: when v_same=0 and v_diff=1 uniformly, use sparse matrix
+    if adjacency_matrix is not None:
+        all_same_zero = np.all(v_same == 0)
+        all_diff_one = np.all(v_diff == 1)
+        if all_same_zero and all_diff_one:
+            degree = np.asarray(adjacency_matrix.sum(axis=1)).ravel()
+            return degree[:, np.newaxis] - adjacency_matrix @ lam
+
     v_lam = np.zeros((N, K), dtype=np.float64)
 
     valid = neighborhood >= 0  # (N, max_nb)
