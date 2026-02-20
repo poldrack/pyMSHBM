@@ -39,7 +39,10 @@ def test_write_dlabel_cifti_correct_data(tmp_path, label_data):
     write_dlabel_cifti(lh, rh, out, num_vertices_lh=10, num_vertices_rh=10)
     img = nib.load(str(out))
     data = np.asarray(img.dataobj).ravel()
-    expected = np.concatenate([lh, rh]).astype(np.float32)
+    # Only cortex (non-medial-wall) vertices are in the data
+    lh_cortex = lh[lh > 0]
+    rh_cortex = rh[rh > 0]
+    expected = np.concatenate([lh_cortex, rh_cortex]).astype(np.float32)
     np.testing.assert_array_equal(data, expected)
 
 
@@ -52,6 +55,32 @@ def test_write_dlabel_cifti_axes(tmp_path, label_data):
     axis_types = {type(a).__name__ for a in axes}
     assert "LabelAxis" in axis_types
     assert "BrainModelAxis" in axis_types
+
+
+def test_write_dlabel_cifti_excludes_medial_wall(tmp_path):
+    """Medial wall vertices (label 0) should not appear in BrainModelAxis."""
+    lh = np.array([0, 1, 2, 0, 3], dtype=np.int32)
+    rh = np.array([1, 0, 2, 3, 0], dtype=np.int32)
+    out = tmp_path / "parc.dlabel.nii"
+    write_dlabel_cifti(lh, rh, out, num_vertices_lh=5, num_vertices_rh=5)
+    img = nib.load(str(out))
+    bm_axis = img.header.get_axis(1)
+    data = np.asarray(img.dataobj).ravel()
+
+    # lh has 3 cortex vertices (indices 1,2,4), rh has 3 (indices 0,2,3)
+    assert len(data) == 6
+
+    # All data values should be > 0 (no medial wall in output)
+    assert np.all(data > 0)
+
+    # Verify vertex indices in BrainModel
+    vertex_indices = list(bm_axis.vertex)
+    assert vertex_indices == [1, 2, 4, 0, 2, 3]
+
+    # num_vertices should still reflect full surface size
+    structures = list(bm_axis.iter_structures())
+    for name, _, bm in structures:
+        assert bm.nvertices[name] == 5
 
 
 def test_write_dlabel_cifti_label_table(tmp_path, label_data):

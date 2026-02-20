@@ -17,6 +17,10 @@ def write_dlabel_cifti(
 ) -> None:
     """Write parcellation labels as a CIFTI .dlabel.nii file.
 
+    Medial wall vertices (label == 0) are excluded from the
+    BrainModelAxis, following standard CIFTI convention. Only
+    cortex vertices are included in the file.
+
     Args:
         lh_labels: (V_lh,) int labels, 0 = medial wall.
         rh_labels: (V_rh,) int labels.
@@ -29,12 +33,16 @@ def write_dlabel_cifti(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Only include cortex vertices (non-medial-wall) in BrainModel
+    lh_cortex = np.where(lh_labels > 0)[0]
+    rh_cortex = np.where(rh_labels > 0)[0]
+
     bm_lh = nib.cifti2.BrainModelAxis.from_surface(
-        np.arange(len(lh_labels)), num_vertices_lh,
+        lh_cortex, num_vertices_lh,
         "CIFTI_STRUCTURE_CORTEX_LEFT",
     )
     bm_rh = nib.cifti2.BrainModelAxis.from_surface(
-        np.arange(len(rh_labels)), num_vertices_rh,
+        rh_cortex, num_vertices_rh,
         "CIFTI_STRUCTURE_CORTEX_RIGHT",
     )
     bm_axis = bm_lh + bm_rh
@@ -45,7 +53,9 @@ def write_dlabel_cifti(
     label_dict = _build_label_dict(num_clusters, label_names, colors)
     label_axis = nib.cifti2.LabelAxis(["parcellation"], [label_dict])
 
-    data = all_labels.reshape(1, -1).astype(np.float32)
+    # Data array contains only cortex vertices
+    cortex_labels = np.concatenate([lh_labels[lh_cortex], rh_labels[rh_cortex]])
+    data = cortex_labels.reshape(1, -1).astype(np.float32)
     header = nib.cifti2.Cifti2Header.from_axes((label_axis, bm_axis))
     img = nib.Cifti2Image(data, header)
     img.to_filename(str(output_path))
